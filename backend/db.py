@@ -82,6 +82,17 @@ CREATE TABLE IF NOT EXISTS sop_versions (
     uploaded_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sop_attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sop_version_id INTEGER NOT NULL REFERENCES sop_versions(id),
+    doc_type TEXT NOT NULL DEFAULT 'Annexure',  -- Annexure | Format | Other
+    filename TEXT NOT NULL,
+    filepath TEXT NOT NULL,
+    extracted_text TEXT,
+    uploaded_by TEXT,
+    uploaded_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS rtm_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     requirement_id INTEGER NOT NULL REFERENCES requirements(id),
@@ -181,3 +192,20 @@ def row_to_dict(row):
 
 def rows_to_list(rows):
     return [row_to_dict(r) for r in rows]
+
+
+def full_sop_text(conn, sop_id):
+    """Concatenated text of a SOP's current main document plus every attachment
+    (annexures, formats) linked to that version -- used for AI analysis so gap
+    assessment and redlining consider the whole SOP package, not just the main doc.
+    """
+    version = conn.execute("SELECT * FROM sop_versions WHERE sop_id=? AND is_current=1", (sop_id,)).fetchone()
+    if not version:
+        return ""
+    parts = [f"=== MAIN SOP DOCUMENT: {version['filename']} ===\n{version['extracted_text'] or ''}"]
+    attachments = conn.execute(
+        "SELECT * FROM sop_attachments WHERE sop_version_id=? ORDER BY id", (version["id"],)
+    ).fetchall()
+    for a in attachments:
+        parts.append(f"=== {a['doc_type'].upper()}: {a['filename']} ===\n{a['extracted_text'] or ''}")
+    return "\n\n".join(parts)

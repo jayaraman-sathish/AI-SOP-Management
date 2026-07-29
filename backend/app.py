@@ -176,7 +176,8 @@ def list_sops():
     site_id = request.args.get("site_id")
     conn = db.get_db()
     q = """
-        SELECT s.*, sv.id as current_version_id, sv.version_label, sv.filename, sv.uploaded_at
+        SELECT s.*, sv.id as current_version_id, sv.version_label, sv.filename, sv.uploaded_at,
+               (SELECT COUNT(*) FROM sop_attachments sa WHERE sa.sop_version_id = sv.id) as attachment_count
         FROM sops s
         LEFT JOIN sop_versions sv ON sv.sop_id = s.id AND sv.is_current = 1
     """
@@ -198,12 +199,38 @@ def upload_sop():
                    version_label, filename, file_base64}
     file_base64 is the raw .docx content, base64-encoded (avoids needing a
     multipart upload library that isn't available in this environment).
+
+    Accepts a package of one or more files under "files": a real SOP is rarely
+    just one document -- it typically comes with annexures and format/template
+    attachments. Exactly one file should be tagged doc_type "Main SOP" (the
+    procedure itself, the one that gets redlined); everything else is stored
+    as a linked attachment (Annexure / Format / Other) and its text is folded
+    into AI analysis alongside the main document, so gap detection considers
+    the whole SOP package, not just the primary file. If no file is explicitly
+    tagged "Main SOP", the first file in the list is used as the main document.
+
+    For backward compatibility, a single-file payload (filename + file_base64
+    at the top level, no "files" array) is still accepted and treated as a
+    one-file package.
     """
     data = request.get_json(force=True)
-    required = ["site_id", "sop_number", "title", "filename", "file_base64"]
+    files_payload = data.get("files")
+    if not files_payload:
+        # Legacy single-file shape.
+        if not data.get("filename") or not data.get("file_base64"):
+            return jsonify({"error": "missing_fields", "fields": ["files (or legacy filename/file_base64)"]}), 400
+        files_payload = [{"filename": data["filename"], "file_base64": data["file_base64"], "doc_type": "Main SOP"}]
+
+    required = ["site_id", "sop_number", "title"]
     missing = [f for f in required if not data.get(f)]
     if missing:
         return jsonify({"error": "missing_fields", "fields": missing}), 400
+    if not isinstance(files_payload, list) or len(files_payload) == 0:
+        return jsonify({"error": "files_must_be_a_non_empty_array"}), 400
+
+    main_files = [f for f in files_payload if (f.get("doc_type") or "").strip().lower() == "main sop"]
+    main_file = main_files[0] if main_files else files_payload[0]
+    other_files = [f for f in files_payload if f is not main_file]
 
     conn = db.get_db()
     sop = conn.execute("SELECT * FROM sops WHERE site_id=? AND sop_number=?", (data["site_id"], data["sop_number"])).fetchone()
@@ -219,31 +246,55 @@ def upload_sop():
                      (data["title"], data.get("process_area", ""), data.get("sop_category", ""), sop_id))
         conn.execute("UPDATE sop_versions SET is_current = 0 WHERE sop_id = ?", (sop_id,))
 
+    def _save_file(file_item):
+        try:
+            file_bytes = base64.b64decode(file_item["file_base64"])
+        except Exception:
+            raise ValueError(f"invalid_base64: {file_item.get('filename')}")
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", file_item["filename"])
+        stored_name = f"sop{sop_id}_{secrets.token_hex(4)}_{safe_name}"
+        filepath = os.path.join(UPLOAD_DIR, stored_name)
+        with open(filepath, "wb") as f:
+            f.write(file_bytes)
+        extracted_text = docx_service.extract_text(filepath) if filepath.lower().endswith(".docx") else ""
+        return filepath, extracted_text
+
     try:
-        file_bytes = base64.b64decode(data["file_base64"])
-    except Exception:
+        main_filepath, main_extracted_text = _save_file(main_file)
+    except ValueError as e:
         conn.close()
-        return jsonify({"error": "invalid_base64"}), 400
-
-    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", data["filename"])
-    stored_name = f"sop{sop_id}_v{secrets.token_hex(4)}_{safe_name}"
-    filepath = os.path.join(UPLOAD_DIR, stored_name)
-    with open(filepath, "wb") as f:
-        f.write(file_bytes)
-
-    extracted_text = docx_service.extract_text(filepath) if filepath.lower().endswith(".docx") else ""
+        return jsonify({"error": str(e)}), 400
 
     version_label = data.get("version_label") or "v1.0"
     cur = conn.execute(
         "INSERT INTO sop_versions (sop_id, version_label, filename, filepath, extracted_text, is_current, uploaded_by, uploaded_at) VALUES (?,?,?,?,?,1,?,?)",
-        (sop_id, version_label, data["filename"], filepath, extracted_text, actor_label(), db.now()),
+        (sop_id, version_label, main_file["filename"], main_filepath, main_extracted_text, actor_label(), db.now()),
     )
     version_id = cur.lastrowid
+
+    attachment_count = 0
+    for f in other_files:
+        try:
+            fpath, ftext = _save_file(f)
+        except ValueError:
+            continue  # skip a bad attachment rather than failing the whole upload
+        doc_type = (f.get("doc_type") or "Annexure").strip() or "Annexure"
+        conn.execute(
+            "INSERT INTO sop_attachments (sop_version_id, doc_type, filename, filepath, extracted_text, uploaded_by, uploaded_at) VALUES (?,?,?,?,?,?,?)",
+            (version_id, doc_type, f["filename"], fpath, ftext, actor_label(), db.now()),
+        )
+        attachment_count += 1
+
     conn.commit()
     conn.close()
 
-    db.log_audit(actor_label(), "upload", "sop_version", version_id, {"sop_id": sop_id, "version_label": version_label})
-    return jsonify({"sop_id": sop_id, "version_id": version_id, "extracted_chars": len(extracted_text)}), 201
+    db.log_audit(actor_label(), "upload", "sop_version", version_id, {
+        "sop_id": sop_id, "version_label": version_label, "attachments": attachment_count,
+    })
+    return jsonify({
+        "sop_id": sop_id, "version_id": version_id,
+        "extracted_chars": len(main_extracted_text), "attachments_saved": attachment_count,
+    }), 201
 
 
 @app.route("/api/sops/<int:sop_id>", methods=["GET"])
@@ -255,9 +306,16 @@ def get_sop(sop_id):
         conn.close()
         return jsonify({"error": "not_found"}), 404
     versions = conn.execute("SELECT id, version_label, filename, uploaded_by, uploaded_at, is_current FROM sop_versions WHERE sop_id=? ORDER BY id DESC", (sop_id,)).fetchall()
+    version_list = db.rows_to_list(versions)
+    for v in version_list:
+        attachments = conn.execute(
+            "SELECT id, doc_type, filename, uploaded_by, uploaded_at FROM sop_attachments WHERE sop_version_id=? ORDER BY id",
+            (v["id"],),
+        ).fetchall()
+        v["attachments"] = db.rows_to_list(attachments)
     conn.close()
     result = db.row_to_dict(sop)
-    result["versions"] = db.rows_to_list(versions)
+    result["versions"] = version_list
     return jsonify(result)
 
 
@@ -305,11 +363,15 @@ def run_rtm_mapping():
 
     requirements = conn.execute("SELECT * FROM requirements ORDER BY id").fetchall()
     sop_rows = conn.execute("""
-        SELECT sop.id as sop_id, sop.sop_number, sop.title, sop.sop_category, sv.extracted_text
+        SELECT sop.id as sop_id, sop.sop_number, sop.title, sop.sop_category
         FROM sops sop JOIN sop_versions sv ON sv.sop_id = sop.id AND sv.is_current = 1
         WHERE sop.site_id = ?
     """, (site_id,)).fetchall()
     sops = db.rows_to_list(sop_rows)
+    # Pull each SOP's combined text (main document + every annexure/format attachment)
+    # once per SOP, so AI analysis considers the whole package, not just the main file.
+    for s in sops:
+        s["full_text"] = db.full_sop_text(conn, s["sop_id"])
 
     results = []
     for req in requirements:
@@ -317,7 +379,7 @@ def run_rtm_mapping():
         candidates = [s for s in sops if (s["sop_category"] or "").strip().lower() == (req_d["sop_category"] or "").strip().lower()]
         if not candidates:
             candidates = sops  # fall back: let the model/heuristic look at everything if no category tag matches
-        excerpts = [{"sop_id": s["sop_id"], "sop_number": s["sop_number"], "title": s["title"], "text": s["extracted_text"] or ""} for s in candidates]
+        excerpts = [{"sop_id": s["sop_id"], "sop_number": s["sop_number"], "title": s["title"], "text": s["full_text"]} for s in candidates]
 
         assessment = ai_service.assess_requirement_coverage(req_d, excerpts)
 
@@ -505,7 +567,11 @@ def generate_redline(gap_id):
         return jsonify({"error": "sop_has_no_current_version"}), 400
 
     requirement_d = db.row_to_dict(requirement)
-    draft = ai_service.draft_redline(requirement_d, gap["description"], version["extracted_text"] or "", sop["title"])
+    # Give the drafting model the whole SOP package (main doc + annexures/formats),
+    # not just the main file, so it doesn't duplicate content that already lives
+    # in an attached annexure or format.
+    full_text = db.full_sop_text(conn, sop_id) or version["extracted_text"] or ""
+    draft = ai_service.draft_redline(requirement_d, gap["description"], full_text, sop["title"])
 
     new_version_label = _bump_version(version["version_label"])
     stored_name = f"redline_sop{sop_id}_gap{gap_id}_{secrets.token_hex(4)}.docx"

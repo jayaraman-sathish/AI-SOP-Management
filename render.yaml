@@ -17,5 +17,5 @@ services:
     # the SQLite database and any uploaded/generated files are wiped on every
     # restart/redeploy (Render's filesystem is ephemeral on free) -- fine for
     # a demo/pilot, not for real data. Upgrade this service to a paid plan and
-    # add a `disk:` block back once you're past the demo stage and have real
-    # SOPs to keep.
+    # add a `disk:` block back (see README "Deploying" section) once you're
+    # past the demo stage and have real SOPs to keep.

@@ -256,35 +256,90 @@ async function sopsView() {
       <td>${s.title}</td>
       <td>${s.sop_category || "<span class='muted'>—</span>"}</td>
       <td>${s.version_label || "—"}</td>
+      <td>${s.attachment_count ? `${s.attachment_count} file${s.attachment_count > 1 ? "s" : ""}` : "<span class='muted'>none</span>"}</td>
       <td>${s.uploaded_at ? s.uploaded_at.slice(0,10) : "—"}</td>
-    </tr>`).join("") || `<tr><td colspan="5" class="muted">No SOPs uploaded for this site yet.</td></tr>`;
+    </tr>`).join("") || `<tr><td colspan="6" class="muted">No SOPs uploaded for this site yet.</td></tr>`;
   return `
     <div class="card">
       <h2>SOP Repository — ${siteLabel()}</h2>
       <div class="row">
-        <button class="btn" id="uploadSopBtn">Upload SOP (.docx)</button>
-        <span class="muted">Upload a real site SOP to run AI-assisted gap analysis and generate a tracked-changes redline.</span>
+        <button class="btn" id="uploadSopBtn">Upload SOP Package</button>
+        <span class="muted">Drop in the main SOP plus any annexures/formats together — AI gap analysis reads all of them.</span>
       </div>
-      <table><thead><tr><th>SOP Number</th><th>Title</th><th>Category</th><th>Version</th><th>Uploaded</th></tr></thead><tbody>${rows}</tbody></table>
+      <table><thead><tr><th>SOP Number</th><th>Title</th><th>Category</th><th>Version</th><th>Attachments</th><th>Uploaded</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
     ${uploadModal()}
   `;
 }
 
+let pendingFiles = []; // [{file, id, doc_type}]
+
+function docTypeOptions(selected) {
+  return ["Main SOP", "Annexure", "Format", "Other"].map(
+    t => `<option value="${t}" ${t === selected ? "selected" : ""}>${t}</option>`
+  ).join("");
+}
+
+function renderFileList() {
+  const el = document.getElementById("fileListBody");
+  if (!el) return;
+  if (!pendingFiles.length) {
+    el.innerHTML = `<div class="muted" style="padding:8px 0;">No files added yet.</div>`;
+    return;
+  }
+  el.innerHTML = pendingFiles.map(pf => `
+    <div class="row" style="justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border); margin-bottom:0;">
+      <div style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${pf.file.name} <span class="muted">(${Math.round(pf.file.size/1024)} KB)</span></div>
+      <select class="fileTypeSelect" data-id="${pf.id}" style="width:130px;">${docTypeOptions(pf.doc_type)}</select>
+      <button class="btn small secondary removeFileBtn" data-id="${pf.id}">Remove</button>
+    </div>`).join("");
+  document.querySelectorAll(".fileTypeSelect").forEach(sel => {
+    sel.onchange = () => {
+      const pf = pendingFiles.find(p => p.id === sel.dataset.id);
+      if (pf) pf.doc_type = sel.value;
+    };
+  });
+  document.querySelectorAll(".removeFileBtn").forEach(btn => {
+    btn.onclick = () => { pendingFiles = pendingFiles.filter(p => p.id !== btn.dataset.id); renderFileList(); };
+  });
+}
+
+function addFiles(fileList) {
+  const incoming = Array.from(fileList).filter(f => /\.docx$/i.test(f.name));
+  const skipped = fileList.length - incoming.length;
+  incoming.forEach((file, idx) => {
+    // First file added overall defaults to "Main SOP" if nothing is tagged that way yet.
+    const alreadyHasMain = pendingFiles.some(p => p.doc_type === "Main SOP");
+    const doc_type = (!alreadyHasMain && idx === 0 && pendingFiles.length === 0) ? "Main SOP" : "Annexure";
+    pendingFiles.push({ file, id: Math.random().toString(36).slice(2), doc_type });
+  });
+  if (skipped > 0) toast(`Skipped ${skipped} file(s) — only .docx is supported.`);
+  renderFileList();
+}
+
 function uploadModal() {
+  pendingFiles = [];
   return `
   <div id="uploadModal" class="modal-bg hidden">
-    <div class="modal">
-      <h3>Upload SOP</h3>
+    <div class="modal" style="width:600px;">
+      <h3>Upload SOP Package</h3>
       <div class="field"><label>SOP Number</label><input id="f_sop_number" placeholder="e.g. SOP-QC-014" /></div>
       <div class="field"><label>Title</label><input id="f_title" placeholder="e.g. Aseptic Process Simulation (Media Fill)" /></div>
       <div class="field"><label>Process Area</label><input id="f_process_area" placeholder="e.g. Aseptic Process Simulation" /></div>
       <div class="field"><label>SOP Category (must match a regulatory requirement's category to be auto-matched — see RTM tab)</label><input id="f_sop_category" placeholder="e.g. Aseptic Process Simulation (Media Fill)" /></div>
       <div class="field"><label>Version Label</label><input id="f_version" placeholder="e.g. v1.0" value="v1.0" /></div>
-      <div class="field"><label>File (.docx)</label><input id="f_file" type="file" accept=".docx" /></div>
+      <div class="field">
+        <label>Files — drag &amp; drop the main SOP plus any annexures/formats, or click to browse (.docx only, multiple allowed)</label>
+        <div id="dropZone" style="border:2px dashed var(--navy-light); border-radius:8px; padding:22px; text-align:center; cursor:pointer; background:#FAFBFF; font-size:13px; color:var(--muted);">
+          Drop .docx files here, or click to choose
+          <input id="f_files" type="file" accept=".docx" multiple style="display:none;" />
+        </div>
+        <div id="fileListBody" style="margin-top:10px;"></div>
+        <p class="muted" style="margin-top:6px;">Tag exactly one file as <b>Main SOP</b> (the procedure itself — this is the one that gets redlined). Everything else — annexures, format/template attachments — is stored alongside it and its text is included when the AI runs gap analysis.</p>
+      </div>
       <div class="row" style="justify-content:flex-end;">
         <button class="btn secondary" id="cancelUpload">Cancel</button>
-        <button class="btn" id="submitUpload">Upload</button>
+        <button class="btn" id="submitUpload">Upload Package</button>
       </div>
     </div>
   </div>`;
@@ -430,11 +485,26 @@ function siteLabel() {
 
 function bindTabHandlers() {
   const uploadBtn = document.getElementById("uploadSopBtn");
-  if (uploadBtn) uploadBtn.onclick = () => document.getElementById("uploadModal").classList.remove("hidden");
+  if (uploadBtn) uploadBtn.onclick = () => { pendingFiles = []; renderFileList(); document.getElementById("uploadModal").classList.remove("hidden"); };
   const cancelUpload = document.getElementById("cancelUpload");
   if (cancelUpload) cancelUpload.onclick = () => document.getElementById("uploadModal").classList.add("hidden");
   const submitUpload = document.getElementById("submitUpload");
   if (submitUpload) submitUpload.onclick = doUploadSop;
+
+  const dropZone = document.getElementById("dropZone");
+  const filesInput = document.getElementById("f_files");
+  if (dropZone && filesInput) {
+    renderFileList();
+    dropZone.onclick = () => filesInput.click();
+    filesInput.onchange = () => { addFiles(filesInput.files); filesInput.value = ""; };
+    dropZone.ondragover = (e) => { e.preventDefault(); dropZone.style.background = "#EEF2FC"; };
+    dropZone.ondragleave = () => { dropZone.style.background = "#FAFBFF"; };
+    dropZone.ondrop = (e) => {
+      e.preventDefault();
+      dropZone.style.background = "#FAFBFF";
+      if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
+    };
+  }
 
   const runRtmBtn = document.getElementById("runRtmBtn");
   if (runRtmBtn) runRtmBtn.onclick = async () => {
@@ -499,33 +569,49 @@ function bindTabHandlers() {
   });
 }
 
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(",")[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
 async function doUploadSop() {
-  const fileInput = document.getElementById("f_file");
-  const file = fileInput.files[0];
-  if (!file) { toast("Choose a .docx file."); return; }
+  if (!pendingFiles.length) { toast("Add at least one .docx file (drag & drop or click the drop zone)."); return; }
   const sop_number = document.getElementById("f_sop_number").value.trim();
   const title = document.getElementById("f_title").value.trim();
   if (!sop_number || !title) { toast("SOP number and title are required."); return; }
-  const reader = new FileReader();
-  reader.onload = async () => {
-    const base64 = reader.result.split(",")[1];
-    try {
-      await api("/sops", {
-        method: "POST",
-        body: JSON.stringify({
-          site_id: state.currentSiteId, sop_number, title,
-          process_area: document.getElementById("f_process_area").value.trim(),
-          sop_category: document.getElementById("f_sop_category").value.trim(),
-          version_label: document.getElementById("f_version").value.trim() || "v1.0",
-          filename: file.name, file_base64: base64,
-        }),
-      });
-      toast("SOP uploaded.");
-      document.getElementById("uploadModal").classList.add("hidden");
-      renderTab();
-    } catch (e) { toast("Error: " + e.message); }
-  };
-  reader.readAsDataURL(file);
+  const mainCount = pendingFiles.filter(p => p.doc_type === "Main SOP").length;
+  if (mainCount === 0) { toast('Tag one file as "Main SOP" — that\'s the procedure that gets redlined.'); return; }
+  if (mainCount > 1) { toast('Only one file can be tagged "Main SOP" — tag the rest as Annexure/Format/Other.'); return; }
+
+  const submitBtn = document.getElementById("submitUpload");
+  submitBtn.disabled = true; submitBtn.textContent = "Uploading…";
+  try {
+    const files = await Promise.all(pendingFiles.map(async pf => ({
+      filename: pf.file.name, doc_type: pf.doc_type, file_base64: await readFileAsBase64(pf.file),
+    })));
+    const res = await api("/sops", {
+      method: "POST",
+      body: JSON.stringify({
+        site_id: state.currentSiteId, sop_number, title,
+        process_area: document.getElementById("f_process_area").value.trim(),
+        sop_category: document.getElementById("f_sop_category").value.trim(),
+        version_label: document.getElementById("f_version").value.trim() || "v1.0",
+        files,
+      }),
+    });
+    toast(`SOP package uploaded — main document plus ${res.attachments_saved} attachment(s).`);
+    document.getElementById("uploadModal").classList.add("hidden");
+    pendingFiles = [];
+    renderTab();
+  } catch (e) {
+    toast("Error: " + e.message);
+  } finally {
+    submitBtn.disabled = false; submitBtn.textContent = "Upload Package";
+  }
 }
 
 render();
