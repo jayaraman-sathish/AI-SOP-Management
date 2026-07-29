@@ -26,6 +26,26 @@ JWT_SECRET = os.environ.get("APP_JWT_SECRET", "dev-secret-change-me-in-productio
 
 app = Flask(__name__)
 
+# Cap total request body size so an oversized SOP package (large scanned annexures,
+# embedded images, etc.) fails fast with a clear error instead of hanging until the
+# gunicorn worker timeout hits, or exhausting memory on a small free-tier instance.
+# 45MB accommodates a real multi-file SOP package (main doc + several annexures/
+# formats) plus the ~33% base64 inflation; raise this (and consider a paid Render
+# plan with more RAM) if your SOPs routinely include large embedded scans/images.
+app.config["MAX_CONTENT_LENGTH"] = 45 * 1024 * 1024
+
+
+@app.errorhandler(413)
+def too_large(_e):
+    return jsonify({
+        "error": "upload_too_large",
+        "message": (
+            "This SOP package is too large for the current server limit (45MB total, "
+            "including base64 encoding overhead). Split large scanned annexures out, "
+            "compress embedded images, or upload the oversized attachment separately."
+        ),
+    }), 413
+
 
 @app.route("/", methods=["GET"])
 def serve_frontend():

@@ -90,7 +90,7 @@ async function api(path, opts = {}) {
   if (res.status === 401) { setToken(null); state.user = null; render(); throw new Error("Session expired"); }
   const isJson = (res.headers.get("content-type") || "").includes("application/json");
   const body = isJson ? await res.json() : await res.blob();
-  if (!res.ok) throw new Error(isJson ? (body.error || JSON.stringify(body)) : "Request failed");
+  if (!res.ok) throw new Error(isJson ? (body.message || body.error || JSON.stringify(body)) : "Request failed (server may be restarting or the upload exceeded the size limit — try a smaller batch)");
   return body;
 }
 
@@ -586,6 +586,16 @@ async function doUploadSop() {
   const mainCount = pendingFiles.filter(p => p.doc_type === "Main SOP").length;
   if (mainCount === 0) { toast('Tag one file as "Main SOP" — that\'s the procedure that gets redlined.'); return; }
   if (mainCount > 1) { toast('Only one file can be tagged "Main SOP" — tag the rest as Annexure/Format/Other.'); return; }
+
+  const totalBytes = pendingFiles.reduce((sum, pf) => sum + pf.file.size, 0);
+  const estimatedUploadMB = Math.round((totalBytes * 1.34) / 1024 / 1024); // base64 overhead
+  if (estimatedUploadMB > 40) {
+    toast(`This batch is ~${estimatedUploadMB}MB once encoded — over the 45MB server limit. Remove a large file (check sizes in the list above) or upload it separately.`);
+    return;
+  }
+  if (estimatedUploadMB > 15) {
+    toast(`Uploading ~${estimatedUploadMB}MB — this may take a minute or two on the free-tier server, please wait.`);
+  }
 
   const submitBtn = document.getElementById("submitUpload");
   submitBtn.disabled = true; submitBtn.textContent = "Uploading…";
