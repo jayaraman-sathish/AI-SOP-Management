@@ -1,0 +1,666 @@
+import os
+import re
+import base64
+import hashlib
+import secrets
+import datetime
+import functools
+
+import jwt
+from flask import Flask, request, jsonify, send_file, g, send_from_directory
+
+import db
+import ai_service
+import docx_service
+import summary_service
+
+BASE_DIR = os.path.dirname(__file__)
+DATA_DIR = db.DATA_DIR
+UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
+GEN_DIR = os.path.join(DATA_DIR, "generated")
+FRONTEND_DIR = os.path.join(BASE_DIR, "..", "frontend")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(GEN_DIR, exist_ok=True)
+
+JWT_SECRET = os.environ.get("APP_JWT_SECRET", "dev-secret-change-me-in-production")
+
+app = Flask(__name__)
+
+
+@app.route("/", methods=["GET"])
+def serve_frontend():
+    return send_from_directory(FRONTEND_DIR, "index.html")
+
+
+@app.after_request
+def add_cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    return resp
+
+
+@app.route("/api/<path:_any>", methods=["OPTIONS"])
+def cors_preflight(_any):
+    return ("", 204)
+
+
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+def hash_password(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    h = hashlib.sha256((salt + password).encode()).hexdigest()
+    return f"{salt}${h}"
+
+
+def check_password(password, stored):
+    try:
+        salt, h = stored.split("$")
+    except ValueError:
+        return False
+    return hashlib.sha256((salt + password).encode()).hexdigest() == h
+
+
+def make_token(user):
+    payload = {
+        "uid": user["id"],
+        "username": user["username"],
+        "role": user["role"],
+        "site_id": user["site_id"],
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=12),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def require_auth(roles=None):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer "):
+                return jsonify({"error": "missing_token"}), 401
+            token = auth.split(" ", 1)[1]
+            try:
+                payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            except jwt.PyJWTError:
+                return jsonify({"error": "invalid_token"}), 401
+            if roles and payload["role"] not in roles:
+                return jsonify({"error": "forbidden", "required_roles": roles}), 403
+            g.user = payload
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def actor_label():
+    u = getattr(g, "user", None)
+    return f"{u['username']} ({u['role']})" if u else "system"
+
+
+# ---------------------------------------------------------------------------
+# Auth routes
+# ---------------------------------------------------------------------------
+@app.route("/api/auth/login", methods=["POST"])
+def login():
+    data = request.get_json(force=True)
+    conn = db.get_db()
+    row = conn.execute("SELECT * FROM users WHERE username = ?", (data.get("username", ""),)).fetchone()
+    conn.close()
+    if not row or not check_password(data.get("password", ""), row["password_hash"]):
+        return jsonify({"error": "invalid_credentials"}), 401
+    token = make_token(row)
+    db.log_audit(row["username"], "login", "user", row["id"])
+    return jsonify({
+        "token": token,
+        "user": {"id": row["id"], "username": row["username"], "name": row["name"], "role": row["role"], "site_id": row["site_id"]},
+    })
+
+
+@app.route("/api/auth/me", methods=["GET"])
+@require_auth()
+def me():
+    conn = db.get_db()
+    row = conn.execute("SELECT id, username, name, role, site_id FROM users WHERE id = ?", (g.user["uid"],)).fetchone()
+    conn.close()
+    return jsonify(db.row_to_dict(row))
+
+
+# ---------------------------------------------------------------------------
+# Sites
+# ---------------------------------------------------------------------------
+@app.route("/api/sites", methods=["GET"])
+@require_auth()
+def list_sites():
+    conn = db.get_db()
+    rows = conn.execute("SELECT * FROM sites ORDER BY code").fetchall()
+    conn.close()
+    return jsonify(db.rows_to_list(rows))
+
+
+@app.route("/api/sites", methods=["POST"])
+@require_auth(roles=["admin"])
+def create_site():
+    data = request.get_json(force=True)
+    conn = db.get_db()
+    cur = conn.execute(
+        "INSERT INTO sites (code, name, location, product_type, sterilization_method, markets, notes, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (data["code"], data["name"], data.get("location", ""), data.get("product_type", ""),
+         data.get("sterilization_method", ""), data.get("markets", ""), data.get("notes", ""), db.now()),
+    )
+    conn.commit()
+    site_id = cur.lastrowid
+    conn.close()
+    db.log_audit(actor_label(), "create", "site", site_id, data)
+    return jsonify({"id": site_id}), 201
+
+
+# ---------------------------------------------------------------------------
+# Requirements (regulatory library)
+# ---------------------------------------------------------------------------
+@app.route("/api/requirements", methods=["GET"])
+@require_auth()
+def list_requirements():
+    conn = db.get_db()
+    rows = conn.execute("SELECT * FROM requirements ORDER BY id").fetchall()
+    conn.close()
+    return jsonify(db.rows_to_list(rows))
+
+
+# ---------------------------------------------------------------------------
+# SOPs
+# ---------------------------------------------------------------------------
+@app.route("/api/sops", methods=["GET"])
+@require_auth()
+def list_sops():
+    site_id = request.args.get("site_id")
+    conn = db.get_db()
+    q = """
+        SELECT s.*, sv.id as current_version_id, sv.version_label, sv.filename, sv.uploaded_at
+        FROM sops s
+        LEFT JOIN sop_versions sv ON sv.sop_id = s.id AND sv.is_current = 1
+    """
+    params = []
+    if site_id:
+        q += " WHERE s.site_id = ?"
+        params.append(site_id)
+    q += " ORDER BY s.sop_number"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return jsonify(db.rows_to_list(rows))
+
+
+@app.route("/api/sops", methods=["POST"])
+@require_auth(roles=["admin", "analyst", "site_owner"])
+def upload_sop():
+    """
+    Accepts JSON: {site_id, sop_number, title, process_area, sop_category,
+                   version_label, filename, file_base64}
+    file_base64 is the raw .docx content, base64-encoded (avoids needing a
+    multipart upload library that isn't available in this environment).
+    """
+    data = request.get_json(force=True)
+    required = ["site_id", "sop_number", "title", "filename", "file_base64"]
+    missing = [f for f in required if not data.get(f)]
+    if missing:
+        return jsonify({"error": "missing_fields", "fields": missing}), 400
+
+    conn = db.get_db()
+    sop = conn.execute("SELECT * FROM sops WHERE site_id=? AND sop_number=?", (data["site_id"], data["sop_number"])).fetchone()
+    if sop is None:
+        cur = conn.execute(
+            "INSERT INTO sops (site_id, sop_number, title, process_area, sop_category, status, created_at) VALUES (?,?,?,?,?, 'active', ?)",
+            (data["site_id"], data["sop_number"], data["title"], data.get("process_area", ""), data.get("sop_category", ""), db.now()),
+        )
+        sop_id = cur.lastrowid
+    else:
+        sop_id = sop["id"]
+        conn.execute("UPDATE sops SET title=?, process_area=?, sop_category=? WHERE id=?",
+                     (data["title"], data.get("process_area", ""), data.get("sop_category", ""), sop_id))
+        conn.execute("UPDATE sop_versions SET is_current = 0 WHERE sop_id = ?", (sop_id,))
+
+    try:
+        file_bytes = base64.b64decode(data["file_base64"])
+    except Exception:
+        conn.close()
+        return jsonify({"error": "invalid_base64"}), 400
+
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", data["filename"])
+    stored_name = f"sop{sop_id}_v{secrets.token_hex(4)}_{safe_name}"
+    filepath = os.path.join(UPLOAD_DIR, stored_name)
+    with open(filepath, "wb") as f:
+        f.write(file_bytes)
+
+    extracted_text = docx_service.extract_text(filepath) if filepath.lower().endswith(".docx") else ""
+
+    version_label = data.get("version_label") or "v1.0"
+    cur = conn.execute(
+        "INSERT INTO sop_versions (sop_id, version_label, filename, filepath, extracted_text, is_current, uploaded_by, uploaded_at) VALUES (?,?,?,?,?,1,?,?)",
+        (sop_id, version_label, data["filename"], filepath, extracted_text, actor_label(), db.now()),
+    )
+    version_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    db.log_audit(actor_label(), "upload", "sop_version", version_id, {"sop_id": sop_id, "version_label": version_label})
+    return jsonify({"sop_id": sop_id, "version_id": version_id, "extracted_chars": len(extracted_text)}), 201
+
+
+@app.route("/api/sops/<int:sop_id>", methods=["GET"])
+@require_auth()
+def get_sop(sop_id):
+    conn = db.get_db()
+    sop = conn.execute("SELECT * FROM sops WHERE id=?", (sop_id,)).fetchone()
+    if not sop:
+        conn.close()
+        return jsonify({"error": "not_found"}), 404
+    versions = conn.execute("SELECT id, version_label, filename, uploaded_by, uploaded_at, is_current FROM sop_versions WHERE sop_id=? ORDER BY id DESC", (sop_id,)).fetchall()
+    conn.close()
+    result = db.row_to_dict(sop)
+    result["versions"] = db.rows_to_list(versions)
+    return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# RTM: AI-assisted requirement-to-SOP mapping
+# ---------------------------------------------------------------------------
+@app.route("/api/rtm", methods=["GET"])
+@require_auth()
+def list_rtm():
+    site_id = request.args.get("site_id")
+    conn = db.get_db()
+    q = """
+        SELECT r.id, r.coverage_status, r.rationale, r.cited_text, r.ai_proposed, r.ai_mock,
+               r.confirmed_by, r.confirmed_at, r.updated_at,
+               req.id as requirement_id, req.req_code, req.source, req.clause, req.process_area,
+               req.requirement_text, req.sop_category,
+               s.id as site_id, s.code as site_code, s.name as site_name,
+               sop.id as sop_id, sop.sop_number, sop.title as sop_title
+        FROM rtm_entries r
+        JOIN requirements req ON req.id = r.requirement_id
+        JOIN sites s ON s.id = r.site_id
+        LEFT JOIN sops sop ON sop.id = r.sop_id
+    """
+    params = []
+    if site_id:
+        q += " WHERE r.site_id = ?"
+        params.append(site_id)
+    q += " ORDER BY req.id"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return jsonify(db.rows_to_list(rows))
+
+
+@app.route("/api/rtm/run-mapping", methods=["POST"])
+@require_auth(roles=["admin", "analyst"])
+def run_rtm_mapping():
+    """Runs AI-assisted coverage assessment for every requirement against a site's SOP set."""
+    data = request.get_json(force=True)
+    site_id = data["site_id"]
+    conn = db.get_db()
+    site = conn.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
+    if not site:
+        conn.close()
+        return jsonify({"error": "site_not_found"}), 404
+
+    requirements = conn.execute("SELECT * FROM requirements ORDER BY id").fetchall()
+    sop_rows = conn.execute("""
+        SELECT sop.id as sop_id, sop.sop_number, sop.title, sop.sop_category, sv.extracted_text
+        FROM sops sop JOIN sop_versions sv ON sv.sop_id = sop.id AND sv.is_current = 1
+        WHERE sop.site_id = ?
+    """, (site_id,)).fetchall()
+    sops = db.rows_to_list(sop_rows)
+
+    results = []
+    for req in requirements:
+        req_d = db.row_to_dict(req)
+        candidates = [s for s in sops if (s["sop_category"] or "").strip().lower() == (req_d["sop_category"] or "").strip().lower()]
+        if not candidates:
+            candidates = sops  # fall back: let the model/heuristic look at everything if no category tag matches
+        excerpts = [{"sop_id": s["sop_id"], "sop_number": s["sop_number"], "title": s["title"], "text": s["extracted_text"] or ""} for s in candidates]
+
+        assessment = ai_service.assess_requirement_coverage(req_d, excerpts)
+
+        existing = conn.execute("SELECT id FROM rtm_entries WHERE requirement_id=? AND site_id=?", (req_d["id"], site_id)).fetchone()
+        sop_id = assessment.get("sop_id")
+        values = (
+            assessment["coverage_status"], assessment.get("rationale", ""), assessment.get("cited_text", ""),
+            1, int(bool(assessment.get("ai_mock"))), db.now(), req_d["id"], site_id, sop_id,
+        )
+        if existing:
+            conn.execute(
+                "UPDATE rtm_entries SET coverage_status=?, rationale=?, cited_text=?, ai_proposed=?, ai_mock=?, updated_at=?, confirmed_by=NULL, confirmed_at=NULL WHERE requirement_id=? AND site_id=?",
+                (assessment["coverage_status"], assessment.get("rationale", ""), assessment.get("cited_text", ""), 1, int(bool(assessment.get("ai_mock"))), db.now(), req_d["id"], site_id),
+            )
+            entry_id = existing["id"]
+            conn.execute("UPDATE rtm_entries SET sop_id=? WHERE id=?", (sop_id, entry_id))
+        else:
+            cur = conn.execute(
+                "INSERT INTO rtm_entries (requirement_id, site_id, sop_id, coverage_status, rationale, cited_text, ai_proposed, ai_mock, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (req_d["id"], site_id, sop_id, assessment["coverage_status"], assessment.get("rationale", ""), assessment.get("cited_text", ""), 1, int(bool(assessment.get("ai_mock"))), db.now()),
+            )
+            entry_id = cur.lastrowid
+
+        # Auto-create/refresh a gap record for anything not fully covered.
+        if assessment["coverage_status"] != "Covered":
+            existing_gap = conn.execute("SELECT id FROM gaps WHERE rtm_entry_id=?", (entry_id,)).fetchone()
+            risk = _default_risk(req_d)
+            desc = f"{assessment['coverage_status']} for {req_d['source']} {req_d['clause']} at {site['code']}: {assessment.get('rationale','')}"
+            if not existing_gap:
+                conn.execute(
+                    "INSERT INTO gaps (rtm_entry_id, site_id, requirement_id, description, risk_level, status, created_at, updated_at) VALUES (?,?,?,?,?, 'Open', ?, ?)",
+                    (entry_id, site_id, req_d["id"], desc, risk, db.now(), db.now()),
+                )
+            else:
+                conn.execute("UPDATE gaps SET description=?, updated_at=? WHERE id=?", (desc, db.now(), existing_gap["id"]))
+
+        results.append({"requirement_id": req_d["id"], "req_code": req_d["req_code"], **assessment})
+
+    conn.commit()
+    conn.close()
+    db.log_audit(actor_label(), "run_rtm_mapping", "site", site_id, {"requirements_assessed": len(results)})
+    return jsonify({"site_id": site_id, "results": results})
+
+
+@app.route("/api/rtm/<int:entry_id>/confirm", methods=["PUT"])
+@require_auth(roles=["admin", "analyst"])
+def confirm_rtm_entry(entry_id):
+    data = request.get_json(force=True)
+    conn = db.get_db()
+    conn.execute(
+        "UPDATE rtm_entries SET coverage_status=?, rationale=?, ai_proposed=0, confirmed_by=?, confirmed_at=?, updated_at=? WHERE id=?",
+        (data["coverage_status"], data.get("rationale", ""), actor_label(), db.now(), db.now(), entry_id),
+    )
+    conn.commit()
+    conn.close()
+    db.log_audit(actor_label(), "confirm_override", "rtm_entry", entry_id, data)
+    return jsonify({"ok": True})
+
+
+def _default_risk(requirement):
+    critical_keywords = ["sterili", "aseptic", "media fill", "endotoxin", "pyrogen", "contamination"]
+    text = (requirement["requirement_text"] + " " + requirement["process_area"]).lower()
+    if any(k in text for k in critical_keywords):
+        return "Critical"
+    return "Major"
+
+
+# ---------------------------------------------------------------------------
+# Site comparison
+# ---------------------------------------------------------------------------
+@app.route("/api/comparison/run", methods=["POST"])
+@require_auth(roles=["admin", "analyst"])
+def run_comparison():
+    data = request.get_json(force=True)
+    sop_category = data["sop_category"]
+    conn = db.get_db()
+    rows = conn.execute("""
+        SELECT sites.code as site_code, sites.name as site_name, sop.sop_number, sop.title, sv.extracted_text
+        FROM sops sop
+        JOIN sites ON sites.id = sop.site_id
+        JOIN sop_versions sv ON sv.sop_id = sop.id AND sv.is_current = 1
+        WHERE sop.sop_category = ?
+    """, (sop_category,)).fetchall()
+    site_sops = [{"site_code": r["site_code"], "site_name": r["site_name"], "sop_number": r["sop_number"], "title": r["title"], "text": r["extracted_text"] or ""} for r in rows]
+    if len(site_sops) < 2:
+        conn.close()
+        return jsonify({"error": "need_at_least_two_sites_with_this_sop_category", "found": len(site_sops)}), 400
+
+    result = ai_service.compare_sops_across_sites(sop_category, site_sops)
+    for finding in result["findings"]:
+        conn.execute(
+            "INSERT INTO comparison_findings (sop_category, process_step, site_values_json, classification, note, ai_mock, created_at) VALUES (?,?,?,?,?,?,?)",
+            (sop_category, finding.get("process_step", ""), __import__("json").dumps(finding.get("site_values", {})),
+             finding.get("classification", "Best-Practice Divergence"), finding.get("note", ""), int(bool(result["ai_mock"])), db.now()),
+        )
+    conn.commit()
+    conn.close()
+    db.log_audit(actor_label(), "run_comparison", "sop_category", None, {"sop_category": sop_category, "findings": len(result["findings"])})
+    return jsonify(result)
+
+
+@app.route("/api/comparison", methods=["GET"])
+@require_auth()
+def list_comparison():
+    conn = db.get_db()
+    rows = conn.execute("SELECT * FROM comparison_findings ORDER BY id DESC").fetchall()
+    conn.close()
+    return jsonify(db.rows_to_list(rows))
+
+
+# ---------------------------------------------------------------------------
+# Gaps
+# ---------------------------------------------------------------------------
+@app.route("/api/gaps", methods=["GET"])
+@require_auth()
+def list_gaps():
+    site_id = request.args.get("site_id")
+    conn = db.get_db()
+    q = """
+        SELECT g.*, s.code as site_code, s.name as site_name, req.req_code, req.source, req.clause, req.requirement_text, req.sop_category
+        FROM gaps g
+        JOIN sites s ON s.id = g.site_id
+        LEFT JOIN requirements req ON req.id = g.requirement_id
+    """
+    params = []
+    if site_id:
+        q += " WHERE g.site_id = ?"
+        params.append(site_id)
+    q += " ORDER BY CASE g.risk_level WHEN 'Critical' THEN 0 WHEN 'Major' THEN 1 ELSE 2 END, g.id DESC"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return jsonify(db.rows_to_list(rows))
+
+
+@app.route("/api/gaps/<int:gap_id>", methods=["PUT"])
+@require_auth()
+def update_gap(gap_id):
+    data = request.get_json(force=True)
+    fields, values = [], []
+    for key in ["owner", "target_date", "status", "risk_level"]:
+        if key in data:
+            fields.append(f"{key}=?")
+            values.append(data[key])
+    if fields:
+        values.append(db.now())
+        values.append(gap_id)
+        conn = db.get_db()
+        conn.execute(f"UPDATE gaps SET {', '.join(fields)}, updated_at=? WHERE id=?", values)
+        conn.commit()
+        conn.close()
+        db.log_audit(actor_label(), "update", "gap", gap_id, data)
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# AI-assisted tracked-change redlining
+# ---------------------------------------------------------------------------
+@app.route("/api/gaps/<int:gap_id>/generate-redline", methods=["POST"])
+@require_auth(roles=["admin", "analyst", "site_owner"])
+def generate_redline(gap_id):
+    conn = db.get_db()
+    gap = conn.execute("SELECT * FROM gaps WHERE id=?", (gap_id,)).fetchone()
+    if not gap:
+        conn.close()
+        return jsonify({"error": "gap_not_found"}), 404
+    requirement = conn.execute("SELECT * FROM requirements WHERE id=?", (gap["requirement_id"],)).fetchone()
+    site = conn.execute("SELECT * FROM sites WHERE id=?", (gap["site_id"],)).fetchone()
+
+    data = request.get_json(silent=True) or {}
+    sop_id = data.get("sop_id")
+    if not sop_id:
+        rtm = conn.execute("SELECT sop_id FROM rtm_entries WHERE id=?", (gap["rtm_entry_id"],)).fetchone() if gap["rtm_entry_id"] else None
+        sop_id = rtm["sop_id"] if rtm and rtm["sop_id"] else None
+    if not sop_id:
+        candidate = conn.execute("SELECT id FROM sops WHERE site_id=? AND sop_category=? LIMIT 1", (gap["site_id"], requirement["sop_category"])).fetchone()
+        sop_id = candidate["id"] if candidate else None
+    if not sop_id:
+        conn.close()
+        return jsonify({"error": "no_target_sop_identified", "hint": "pass sop_id explicitly in the request body"}), 400
+
+    sop = conn.execute("SELECT * FROM sops WHERE id=?", (sop_id,)).fetchone()
+    version = conn.execute("SELECT * FROM sop_versions WHERE sop_id=? AND is_current=1", (sop_id,)).fetchone()
+    if not version:
+        conn.close()
+        return jsonify({"error": "sop_has_no_current_version"}), 400
+
+    requirement_d = db.row_to_dict(requirement)
+    draft = ai_service.draft_redline(requirement_d, gap["description"], version["extracted_text"] or "", sop["title"])
+
+    new_version_label = _bump_version(version["version_label"])
+    stored_name = f"redline_sop{sop_id}_gap{gap_id}_{secrets.token_hex(4)}.docx"
+    output_path = os.path.join(GEN_DIR, stored_name)
+    docx_service.generate_tracked_redline(
+        version["filepath"], output_path, draft["heading"], draft["paragraphs"], requirement_d,
+        new_version_label=new_version_label, gap_description=gap["description"],
+    )
+
+    summary_name = f"summary_sop{sop_id}_gap{gap_id}_{secrets.token_hex(4)}.docx"
+    summary_path = os.path.join(GEN_DIR, summary_name)
+    summary_service.generate_change_summary(
+        summary_path, sop_title=sop["title"], sop_number=sop["sop_number"], site_name=site["name"],
+        prev_version=version["version_label"], new_version=new_version_label,
+        revision_date=datetime.date.today().isoformat(), prepared_by=actor_label(),
+        requirement=requirement_d, gap_description=gap["description"], change_heading=draft["heading"],
+        change_paragraphs=draft["paragraphs"], ai_mock=draft.get("ai_mock", False),
+    )
+
+    cur = conn.execute(
+        """INSERT INTO sop_revisions (gap_id, sop_id, base_version_id, new_version_label, draft_filepath,
+           summary_filepath, ai_mock, status, created_by, created_at)
+           VALUES (?,?,?,?,?,?,?, 'Draft', ?, ?)""",
+        (gap_id, sop_id, version["id"], new_version_label, output_path, summary_path,
+         int(bool(draft.get("ai_mock"))), actor_label(), db.now()),
+    )
+    revision_id = cur.lastrowid
+    conn.execute("UPDATE gaps SET status='In Progress', updated_at=? WHERE id=?", (db.now(), gap_id))
+    conn.commit()
+    conn.close()
+
+    db.log_audit(actor_label(), "generate_redline", "sop_revision", revision_id, {"gap_id": gap_id, "ai_mock": draft.get("ai_mock")})
+    return jsonify({"revision_id": revision_id, "new_version_label": new_version_label, "ai_mock": draft.get("ai_mock", False), "draft": draft})
+
+
+def _bump_version(label):
+    m = re.match(r"v?(\d+)\.(\d+)", label or "v1.0")
+    if m:
+        major, minor = int(m.group(1)), int(m.group(2))
+        return f"v{major}.{minor + 1}"
+    return "v1.1"
+
+
+@app.route("/api/revisions", methods=["GET"])
+@require_auth()
+def list_revisions():
+    conn = db.get_db()
+    rows = conn.execute("""
+        SELECT rev.*, sop.sop_number, sop.title as sop_title, s.code as site_code
+        FROM sop_revisions rev
+        JOIN sops sop ON sop.id = rev.sop_id
+        JOIN sites s ON s.id = sop.site_id
+        ORDER BY rev.id DESC
+    """).fetchall()
+    conn.close()
+    return jsonify(db.rows_to_list(rows))
+
+
+@app.route("/api/revisions/<int:revision_id>/download/<kind>", methods=["GET"])
+@require_auth()
+def download_revision_file(revision_id, kind):
+    conn = db.get_db()
+    rev = conn.execute("SELECT * FROM sop_revisions WHERE id=?", (revision_id,)).fetchone()
+    conn.close()
+    if not rev:
+        return jsonify({"error": "not_found"}), 404
+    path = rev["draft_filepath"] if kind == "redline" else rev["summary_filepath"] if kind == "summary" else None
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "file_not_found"}), 404
+    fname = f"{kind}_{rev['id']}.docx"
+    return send_file(path, as_attachment=True, download_name=fname)
+
+
+@app.route("/api/revisions/<int:revision_id>/decision", methods=["POST"])
+@require_auth(roles=["qa_reviewer", "quality_lead", "admin"])
+def decide_revision(revision_id):
+    data = request.get_json(force=True)
+    decision = data.get("decision")  # 'Approved' | 'Rejected'
+    signature_name = data.get("signature_name")
+    notes = data.get("notes", "")
+    if decision not in ("Approved", "Rejected") or not signature_name:
+        return jsonify({"error": "decision and signature_name are required"}), 400
+
+    conn = db.get_db()
+    rev = conn.execute("SELECT * FROM sop_revisions WHERE id=?", (revision_id,)).fetchone()
+    if not rev:
+        conn.close()
+        return jsonify({"error": "not_found"}), 404
+
+    conn.execute(
+        "UPDATE sop_revisions SET status=?, decided_by=?, decided_at=?, decision_notes=? WHERE id=?",
+        (decision, f"{signature_name} ({actor_label()})", db.now(), notes, revision_id),
+    )
+    if decision == "Approved":
+        conn.execute(
+            "INSERT INTO sop_versions (sop_id, version_label, filename, filepath, extracted_text, is_current, uploaded_by, uploaded_at) VALUES (?,?,?,?,?,1,?,?)",
+            (rev["sop_id"], rev["new_version_label"], os.path.basename(rev["draft_filepath"]), rev["draft_filepath"],
+             docx_service.extract_text(rev["draft_filepath"]), actor_label(), db.now()),
+        )
+        conn.execute("UPDATE sop_versions SET is_current=0 WHERE sop_id=? AND id!=(SELECT MAX(id) FROM sop_versions WHERE sop_id=?)", (rev["sop_id"], rev["sop_id"]))
+        gap = conn.execute("SELECT * FROM gaps WHERE id=?", (rev["gap_id"],)).fetchone()
+        conn.execute("UPDATE gaps SET status='Closed', updated_at=? WHERE id=?", (db.now(), rev["gap_id"]))
+        if gap and gap["rtm_entry_id"]:
+            conn.execute(
+                "UPDATE rtm_entries SET coverage_status='Covered', sop_id=?, confirmed_by=?, confirmed_at=?, updated_at=? WHERE id=?",
+                (rev["sop_id"], f"{signature_name} (e-signature)", db.now(), db.now(), gap["rtm_entry_id"]),
+            )
+    conn.commit()
+    conn.close()
+    db.log_audit(f"{signature_name} ({actor_label()})", f"e-signature:{decision}", "sop_revision", revision_id, {"notes": notes})
+    return jsonify({"ok": True, "status": decision})
+
+
+# ---------------------------------------------------------------------------
+# Dashboard & audit
+# ---------------------------------------------------------------------------
+@app.route("/api/dashboard/stats", methods=["GET"])
+@require_auth()
+def dashboard_stats():
+    conn = db.get_db()
+    sites = db.rows_to_list(conn.execute("SELECT * FROM sites ORDER BY code").fetchall())
+    total_reqs = conn.execute("SELECT COUNT(*) c FROM requirements").fetchone()["c"]
+    per_site = []
+    for site in sites:
+        counts = {"Covered": 0, "Partially Covered": 0, "Not Covered": 0, "SOP Missing": 0, "Not Assessed": 0}
+        rows = conn.execute("SELECT coverage_status, COUNT(*) c FROM rtm_entries WHERE site_id=? GROUP BY coverage_status", (site["id"],)).fetchall()
+        assessed = 0
+        for r in rows:
+            counts[r["coverage_status"]] = r["c"]
+            assessed += r["c"]
+        counts["Not Assessed"] = max(total_reqs - assessed, 0)
+        open_gaps = conn.execute("SELECT risk_level, COUNT(*) c FROM gaps WHERE site_id=? AND status!='Closed' GROUP BY risk_level", (site["id"],)).fetchall()
+        gap_counts = {"Critical": 0, "Major": 0, "Minor": 0}
+        for g in open_gaps:
+            gap_counts[g["risk_level"]] = g["c"]
+        per_site.append({"site": site, "coverage": counts, "total_requirements": total_reqs, "open_gaps": gap_counts})
+    conn.close()
+    return jsonify({"total_requirements": total_reqs, "sites": per_site})
+
+
+@app.route("/api/audit", methods=["GET"])
+@require_auth(roles=["admin", "quality_lead", "auditor"])
+def list_audit():
+    conn = db.get_db()
+    rows = conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 500").fetchall()
+    conn.close()
+    return jsonify(db.rows_to_list(rows))
+
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "ai_live": bool(ai_service.ANTHROPIC_API_KEY)})
+
+
+if __name__ == "__main__":
+    db.init_db()
+    port = int(os.environ.get("PORT", 5057))
+    app.run(host="0.0.0.0", port=port, debug=True)

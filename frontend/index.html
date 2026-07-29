@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SOP Compliance Intelligence Platform</title>
+<style>
+  :root {
+    --navy: #1F3864; --navy-light: #2E4E8C; --blue-bg: #D9E2F3; --grey-bg: #F2F2F2;
+    --green: #E2EFDA; --green-text: #2E7D32; --yellow: #FFF2CC; --yellow-text: #8A6D00;
+    --red: #FCE4E4; --red-text: #C0392B; --border: #D8DEE9; --text: #1A1A1A; --muted: #6B7280;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: Arial, Helvetica, sans-serif; background:#F7F8FA; color:var(--text); }
+  header { background:var(--navy); color:#fff; padding:14px 24px; display:flex; align-items:center; justify-content:space-between; }
+  header h1 { font-size:18px; margin:0; font-weight:700; }
+  header .sub { font-size:11px; opacity:0.75; }
+  #userBox { font-size:13px; display:flex; align-items:center; gap:12px; }
+  #userBox button { background:var(--navy-light); color:#fff; border:1px solid rgba(255,255,255,0.3); padding:6px 12px; border-radius:6px; cursor:pointer; }
+  nav { background:#fff; border-bottom:1px solid var(--border); padding:0 24px; display:flex; gap:4px; }
+  nav button { background:none; border:none; padding:12px 16px; font-size:13px; cursor:pointer; color:var(--muted); border-bottom:3px solid transparent; font-weight:600; }
+  nav button.active { color:var(--navy); border-bottom-color:var(--navy); }
+  main { padding:24px; max-width:1300px; margin:0 auto; }
+  .card { background:#fff; border:1px solid var(--border); border-radius:10px; padding:20px; margin-bottom:20px; }
+  .card h2 { margin-top:0; font-size:16px; color:var(--navy); }
+  .card h3 { font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  .grid { display:grid; gap:16px; }
+  .grid-4 { grid-template-columns: repeat(4, 1fr); }
+  .grid-2 { grid-template-columns: repeat(2, 1fr); }
+  .stat { background:var(--grey-bg); border-radius:8px; padding:14px; }
+  .stat .num { font-size:26px; font-weight:700; color:var(--navy); }
+  .stat .lbl { font-size:12px; color:var(--muted); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); vertical-align:top; }
+  th { background:var(--navy); color:#fff; font-weight:600; font-size:12px; }
+  tr:hover td { background:#FAFBFF; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:700; }
+  .badge.Covered { background:var(--green); color:var(--green-text); }
+  .badge.PartiallyCovered, .badge.Partially { background:var(--yellow); color:var(--yellow-text); }
+  .badge.NotCovered, .badge.Not { background:var(--red); color:var(--red-text); }
+  .badge.SOPMissing, .badge.SOP { background:#F4CCCC; color:#8B0000; }
+  .badge.NotAssessed { background:#eee; color:#777; }
+  .badge.Critical { background:#F4CCCC; color:#8B0000; }
+  .badge.Major { background:var(--yellow); color:var(--yellow-text); }
+  .badge.Minor { background:var(--grey-bg); color:var(--muted); }
+  .badge.mock { background:#FFE9CC; color:#9A5B00; }
+  .badge.live { background:var(--green); color:var(--green-text); }
+  select, input, textarea, button.btn { font-family:inherit; font-size:13px; padding:7px 10px; border:1px solid var(--border); border-radius:6px; }
+  button.btn { background:var(--navy); color:#fff; border:none; cursor:pointer; font-weight:600; }
+  button.btn:hover { background:var(--navy-light); }
+  button.btn.secondary { background:#fff; color:var(--navy); border:1px solid var(--navy); }
+  button.btn.small { padding:4px 8px; font-size:12px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
+  .muted { color:var(--muted); font-size:12px; }
+  .toast { position:fixed; bottom:20px; right:20px; background:var(--navy); color:#fff; padding:12px 18px; border-radius:8px; font-size:13px; box-shadow:0 4px 12px rgba(0,0,0,0.2); z-index:1000; max-width:400px; }
+  .login-wrap { display:flex; align-items:center; justify-content:center; min-height:100vh; background:linear-gradient(135deg,#1F3864,#2E4E8C); }
+  .login-card { background:#fff; padding:36px; border-radius:12px; width:380px; box-shadow:0 10px 40px rgba(0,0,0,0.25); }
+  .login-card h1 { color:var(--navy); font-size:20px; margin-bottom:4px; }
+  .login-card p.muted { margin-top:0; }
+  .login-card input { width:100%; margin-bottom:10px; }
+  .login-card button { width:100%; padding:10px; margin-top:6px; }
+  .demo-list { font-size:11px; color:var(--muted); margin-top:16px; border-top:1px solid var(--border); padding-top:12px; line-height:1.6; }
+  .hidden { display:none !important; }
+  .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,0.4); display:flex; align-items:center; justify-content:center; z-index:900; }
+  .modal { background:#fff; border-radius:10px; padding:24px; width:520px; max-height:80vh; overflow:auto; }
+  .modal h3 { margin-top:0; color:var(--navy); }
+  .field { margin-bottom:12px; }
+  .field label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; font-weight:600; }
+  .field input, .field select, .field textarea { width:100%; }
+  .ai-banner { background:#FFE9CC; border:1px solid #F0C070; color:#8A5A00; padding:8px 12px; border-radius:6px; font-size:12px; margin-bottom:14px; }
+  .ai-live-banner { background:var(--green); border:1px solid #93C47D; color:var(--green-text); padding:8px 12px; border-radius:6px; font-size:12px; margin-bottom:14px; }
+  code.ex { background:var(--grey-bg); padding:1px 5px; border-radius:4px; font-size:11px; }
+</style>
+</head>
+<body>
+
+<div id="app"></div>
+
+<script>
+const API = "/api"; // Flask serves this frontend and the API from the same origin.
+let state = { token: localStorage_token(), user: null, tab: "dashboard", sites: [], currentSiteId: null };
+
+function localStorage_token() { try { return sessionStorage.getItem("sop_token"); } catch(e) { return null; } }
+function setToken(t) { state.token = t; try { sessionStorage.setItem("sop_token", t || ""); } catch(e) {} }
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+  if (state.token) headers["Authorization"] = "Bearer " + state.token;
+  const res = await fetch(API + path, Object.assign({}, opts, { headers }));
+  if (res.status === 401) { setToken(null); state.user = null; render(); throw new Error("Session expired"); }
+  const isJson = (res.headers.get("content-type") || "").includes("application/json");
+  const body = isJson ? await res.json() : await res.blob();
+  if (!res.ok) throw new Error(isJson ? (body.error || JSON.stringify(body)) : "Request failed");
+  return body;
+}
+
+function toast(msg) {
+  const el = document.createElement("div");
+  el.className = "toast";
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+function badgeClass(status) { return "badge " + (status || "").replace(/[^A-Za-z]/g, ""); }
+
+async function render() {
+  const app = document.getElementById("app");
+  if (!state.token) { app.innerHTML = loginView(); attachLoginHandlers(); return; }
+  if (!state.user) {
+    try { state.user = await api("/auth/me"); }
+    catch (e) { setToken(null); app.innerHTML = loginView(); attachLoginHandlers(); return; }
+  }
+  if (!state.sites.length) {
+    try { state.sites = await api("/sites"); if (!state.currentSiteId && state.sites.length) state.currentSiteId = state.sites[0].id; }
+    catch (e) {}
+  }
+  app.innerHTML = shellView();
+  attachShellHandlers();
+  await renderTab();
+}
+
+function loginView() {
+  return `
+  <div class="login-wrap">
+    <div class="login-card">
+      <h1>SOP Compliance Intelligence Platform</h1>
+      <p class="muted">Sterile / Injectable Manufacturing — Prototype</p>
+      <div id="loginError" style="color:#C0392B;font-size:12px;margin-bottom:8px;"></div>
+      <input id="username" placeholder="Username" autocomplete="username" />
+      <input id="password" type="password" placeholder="Password" autocomplete="current-password" />
+      <button class="btn" id="loginBtn">Sign In</button>
+      <div class="demo-list">
+        <b>Demo accounts</b> (seeded by <code class="ex">seed.py</code>):<br/>
+        admin / admin123 — System Administrator<br/>
+        analyst / analyst123 — Regulatory Analyst<br/>
+        site1owner / site123 — Site 1 SOP Owner<br/>
+        qa1 / qa123 — Site 1 QA Reviewer<br/>
+        quality_lead / lead123 — Global Quality Lead<br/>
+        auditor / audit123 — Auditor (read-only)
+      </div>
+    </div>
+  </div>`;
+}
+
+function attachLoginHandlers() {
+  const doLogin = async () => {
+    const username = document.getElementById("username").value.trim();
+    const password = document.getElementById("password").value;
+    try {
+      const res = await api("/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
+      setToken(res.token); state.user = res.user; state.sites = [];
+      render();
+    } catch (e) {
+      document.getElementById("loginError").textContent = "Invalid username or password.";
+    }
+  };
+  document.getElementById("loginBtn").onclick = doLogin;
+  document.getElementById("password").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+}
+
+const TABS = [
+  { id: "dashboard", label: "Dashboard" },
+  { id: "sops", label: "SOP Repository" },
+  { id: "rtm", label: "RTM" },
+  { id: "comparison", label: "Site Comparison" },
+  { id: "gaps", label: "Gaps & Redlines" },
+  { id: "revisions", label: "Review & Approval" },
+  { id: "audit", label: "Audit Trail" },
+];
+
+function shellView() {
+  const siteOptions = state.sites.map(s => `<option value="${s.id}" ${s.id === state.currentSiteId ? "selected" : ""}>${s.code} — ${s.name}</option>`).join("");
+  return `
+  <header>
+    <div>
+      <h1>SOP Compliance Intelligence Platform</h1>
+      <div class="sub">Sterile / Injectable Manufacturing — Prototype (Flask + SQLite, AI: ${state.aiLive ? "live" : "checking…"})</div>
+    </div>
+    <div id="userBox">
+      <span>${state.user.name} <span class="muted">(${state.user.role})</span></span>
+      <select id="siteSwitcher">${siteOptions}</select>
+      <button id="logoutBtn">Log out</button>
+    </div>
+  </header>
+  <nav>${TABS.map(t => `<button data-tab="${t.id}" class="${state.tab === t.id ? "active" : ""}">${t.label}</button>`).join("")}</nav>
+  <main id="mainContent"></main>
+  `;
+}
+
+function attachShellHandlers() {
+  document.getElementById("logoutBtn").onclick = () => { setToken(null); state.user = null; render(); };
+  document.getElementById("siteSwitcher").onchange = (e) => { state.currentSiteId = parseInt(e.target.value, 10); renderTab(); };
+  document.querySelectorAll("nav button").forEach(btn => {
+    btn.onclick = () => { state.tab = btn.dataset.tab; render(); };
+  });
+  api("/health").then(h => { state.aiLive = h.ai_live; document.querySelector("header .sub").textContent =
+    `Sterile / Injectable Manufacturing — Prototype (Flask + SQLite, AI: ${h.ai_live ? "live Claude API" : "offline heuristic mode"})`; }).catch(()=>{});
+}
+
+async function renderTab() {
+  const main = document.getElementById("mainContent");
+  main.innerHTML = `<div class="muted">Loading…</div>`;
+  try {
+    if (state.tab === "dashboard") main.innerHTML = await dashboardView();
+    else if (state.tab === "sops") main.innerHTML = await sopsView();
+    else if (state.tab === "rtm") main.innerHTML = await rtmView();
+    else if (state.tab === "comparison") main.innerHTML = await comparisonView();
+    else if (state.tab === "gaps") main.innerHTML = await gapsView();
+    else if (state.tab === "revisions") main.innerHTML = await revisionsView();
+    else if (state.tab === "audit") main.innerHTML = await auditView();
+    bindTabHandlers();
+  } catch (e) {
+    main.innerHTML = `<div class="card">Error: ${e.message}</div>`;
+  }
+}
+
+// ---------------- Dashboard ----------------
+async function dashboardView() {
+  const stats = await api("/dashboard/stats");
+  const cards = stats.sites.map(s => {
+    const c = s.coverage;
+    const pct = s.total_requirements ? Math.round(100 * c.Covered / s.total_requirements) : 0;
+    return `
+    <div class="card">
+      <h2>${s.site.code} — ${s.site.name}</h2>
+      <div class="grid grid-4">
+        <div class="stat"><div class="num">${pct}%</div><div class="lbl">Fully Covered</div></div>
+        <div class="stat"><div class="num">${c.Covered}</div><div class="lbl">Covered</div></div>
+        <div class="stat"><div class="num">${c["Partially Covered"]}</div><div class="lbl">Partially Covered</div></div>
+        <div class="stat"><div class="num">${c["Not Covered"] + c["SOP Missing"]}</div><div class="lbl">Not Covered / Missing</div></div>
+      </div>
+      <h3 style="margin-top:16px;">Open Gaps by Risk</h3>
+      <div class="row">
+        <span class="badge Critical">Critical: ${s.open_gaps.Critical}</span>
+        <span class="badge Major">Major: ${s.open_gaps.Major}</span>
+        <span class="badge Minor">Minor: ${s.open_gaps.Minor}</span>
+      </div>
+    </div>`;
+  }).join("");
+  return `
+    <div class="card">
+      <h2>Program Overview</h2>
+      <p class="muted">${stats.total_requirements} regulatory requirements tracked (FDA 21 CFR 210/211, EU GMP Annex 1, ICH Q7/Q9/Q10, WHO GMP TRS 1044) across ${stats.sites.length} site(s).</p>
+    </div>
+    ${cards}
+  `;
+}
+
+// ---------------- SOP Repository ----------------
+async function sopsView() {
+  const sops = await api("/sops?site_id=" + state.currentSiteId);
+  const rows = sops.map(s => `
+    <tr>
+      <td>${s.sop_number}</td>
+      <td>${s.title}</td>
+      <td>${s.sop_category || "<span class='muted'>—</span>"}</td>
+      <td>${s.version_label || "—"}</td>
+      <td>${s.uploaded_at ? s.uploaded_at.slice(0,10) : "—"}</td>
+    </tr>`).join("") || `<tr><td colspan="5" class="muted">No SOPs uploaded for this site yet.</td></tr>`;
+  return `
+    <div class="card">
+      <h2>SOP Repository — ${siteLabel()}</h2>
+      <div class="row">
+        <button class="btn" id="uploadSopBtn">Upload SOP (.docx)</button>
+        <span class="muted">Upload a real site SOP to run AI-assisted gap analysis and generate a tracked-changes redline.</span>
+      </div>
+      <table><thead><tr><th>SOP Number</th><th>Title</th><th>Category</th><th>Version</th><th>Uploaded</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>
+    ${uploadModal()}
+  `;
+}
+
+function uploadModal() {
+  return `
+  <div id="uploadModal" class="modal-bg hidden">
+    <div class="modal">
+      <h3>Upload SOP</h3>
+      <div class="field"><label>SOP Number</label><input id="f_sop_number" placeholder="e.g. SOP-QC-014" /></div>
+      <div class="field"><label>Title</label><input id="f_title" placeholder="e.g. Aseptic Process Simulation (Media Fill)" /></div>
+      <div class="field"><label>Process Area</label><input id="f_process_area" placeholder="e.g. Aseptic Process Simulation" /></div>
+      <div class="field"><label>SOP Category (must match a regulatory requirement's category to be auto-matched — see RTM tab)</label><input id="f_sop_category" placeholder="e.g. Aseptic Process Simulation (Media Fill)" /></div>
+      <div class="field"><label>Version Label</label><input id="f_version" placeholder="e.g. v1.0" value="v1.0" /></div>
+      <div class="field"><label>File (.docx)</label><input id="f_file" type="file" accept=".docx" /></div>
+      <div class="row" style="justify-content:flex-end;">
+        <button class="btn secondary" id="cancelUpload">Cancel</button>
+        <button class="btn" id="submitUpload">Upload</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ---------------- RTM ----------------
+async function rtmView() {
+  const entries = await api("/rtm?site_id=" + state.currentSiteId);
+  const rows = entries.map(e => `
+    <tr>
+      <td>${e.req_code}<br/><span class="muted">${e.source}</span></td>
+      <td>${e.clause}</td>
+      <td>${e.requirement_text}</td>
+      <td>${e.sop_number ? e.sop_number + "<br/><span class='muted'>" + e.sop_title + "</span>" : "<span class='muted'>none</span>"}</td>
+      <td><span class="${badgeClass(e.coverage_status)}">${e.coverage_status}</span>
+        ${e.ai_proposed ? `<div><span class="badge ${e.ai_mock ? 'mock' : 'live'}">${e.ai_mock ? "AI mock" : "AI"}</span></div>` : e.confirmed_by ? `<div class="muted" style="font-size:10px;">confirmed by ${e.confirmed_by}</div>` : ""}
+      </td>
+      <td style="max-width:220px;">${e.rationale || ""}</td>
+    </tr>`).join("") || `<tr><td colspan="6" class="muted">No RTM entries yet — click "Run AI Gap Analysis" below.</td></tr>`;
+  return `
+    <div class="card">
+      <h2>Requirement Traceability Matrix — ${siteLabel()}</h2>
+      ${state.aiLive ? "" : `<div class="ai-banner">⚠ Running in offline heuristic mode — no ANTHROPIC_API_KEY configured on the server. Coverage assessments below are placeholder keyword-overlap results, clearly flagged "AI mock". Set the key to get real semantic analysis.</div>`}
+      <div class="row">
+        <button class="btn" id="runRtmBtn">Run AI Gap Analysis for ${siteLabel()}</button>
+        <span class="muted">Assesses every regulatory requirement against this site's uploaded SOPs.</span>
+      </div>
+      <table><thead><tr><th>Requirement</th><th>Clause</th><th>Text</th><th>Matched SOP</th><th>Status</th><th>Rationale</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>
+  `;
+}
+
+// ---------------- Comparison ----------------
+async function comparisonView() {
+  const findings = await api("/comparison");
+  const rows = findings.map(f => {
+    const values = JSON.parse(f.site_values_json || "{}");
+    const valStr = Object.entries(values).map(([k, v]) => `<b>${k}</b>: ${v}`).join("<br/>");
+    return `<tr>
+      <td>${f.sop_category}</td>
+      <td>${f.process_step}</td>
+      <td>${valStr}</td>
+      <td><span class="badge ${f.classification.includes("Compliance") ? "NotCovered" : f.classification.includes("Best") ? "Partially" : "Covered"}">${f.classification}</span></td>
+      <td>${f.note || ""}</td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="5" class="muted">No comparisons run yet.</td></tr>`;
+
+  const categories = [...new Set((await api("/sops?site_id=")).map(s => s.sop_category).filter(Boolean))];
+  const allSops = await api("/sops?site_id=");
+  const catOptions = [...new Set(allSops.map(s => s.sop_category).filter(Boolean))].map(c => `<option value="${c}">${c}</option>`).join("");
+
+  return `
+    <div class="card">
+      <h2>Site-to-Site Comparison</h2>
+      <p class="muted">Compares SOPs sharing the same category across sites and classifies each difference (needs the same SOP category uploaded at 2+ sites).</p>
+      <div class="row">
+        <select id="compareCategory"><option value="">Select SOP category…</option>${catOptions}</select>
+        <button class="btn" id="runCompareBtn">Run Comparison</button>
+      </div>
+      <table><thead><tr><th>Category</th><th>Process Step</th><th>Site Values</th><th>Classification</th><th>Note</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>
+  `;
+}
+
+// ---------------- Gaps ----------------
+async function gapsView() {
+  const gaps = await api("/gaps?site_id=" + state.currentSiteId);
+  const rows = gaps.map(g => `
+    <tr>
+      <td><span class="badge ${g.risk_level}">${g.risk_level}</span></td>
+      <td>${g.req_code || ""}<br/><span class="muted">${g.source || ""} ${g.clause || ""}</span></td>
+      <td style="max-width:260px;">${g.description}</td>
+      <td>${g.status}</td>
+      <td><input class="ownerInput" data-gap="${g.id}" value="${g.owner || ""}" placeholder="owner" style="width:90px;" /></td>
+      <td><input class="dateInput" data-gap="${g.id}" type="date" value="${g.target_date || ""}" /></td>
+      <td>${g.status !== "Closed" ? `<button class="btn small genRedlineBtn" data-gap="${g.id}">Generate Redline</button>` : "<span class='muted'>Closed</span>"}</td>
+    </tr>`).join("") || `<tr><td colspan="7" class="muted">No open gaps — run the RTM gap analysis first.</td></tr>`;
+  return `
+    <div class="card">
+      <h2>Gaps & AI-Assisted Redlining — ${siteLabel()}</h2>
+      <p class="muted">Every non-"Covered" RTM entry becomes a gap here. Generating a redline produces a Word file with native Track Changes enabled, plus a matching Change Summary — both land in the Review &amp; Approval tab.</p>
+      <table><thead><tr><th>Risk</th><th>Requirement</th><th>Description</th><th>Status</th><th>Owner</th><th>Target Date</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>
+  `;
+}
+
+// ---------------- Revisions (Review & Approval) ----------------
+async function revisionsView() {
+  const revs = await api("/revisions");
+  const canDecide = ["qa_reviewer", "quality_lead", "admin"].includes(state.user.role);
+  const rows = revs.map(r => `
+    <tr>
+      <td>${r.site_code}</td>
+      <td>${r.sop_number}<br/><span class="muted">${r.sop_title}</span></td>
+      <td>${r.new_version_label}</td>
+      <td><span class="badge ${r.status === 'Approved' ? 'Covered' : r.status === 'Rejected' ? 'NotCovered' : 'Partially'}">${r.status}</span> ${r.ai_mock ? `<span class="badge mock">AI mock</span>` : ""}</td>
+      <td>
+        <button class="btn small secondary dlBtn" data-rev="${r.id}" data-kind="redline">Download Redline</button>
+        <button class="btn small secondary dlBtn" data-rev="${r.id}" data-kind="summary">Download Summary</button>
+      </td>
+      <td>${r.status === "Draft" && canDecide ? `
+        <input class="sigInput" data-rev="${r.id}" placeholder="Type your full name to sign" style="width:160px;" />
+        <button class="btn small approveBtn" data-rev="${r.id}">Approve</button>
+        <button class="btn small secondary rejectBtn" data-rev="${r.id}">Reject</button>
+      ` : (r.decided_by ? `<span class="muted">by ${r.decided_by}</span>` : "")}</td>
+    </tr>`).join("") || `<tr><td colspan="6" class="muted">No SOP revisions generated yet.</td></tr>`;
+  return `
+    <div class="card">
+      <h2>Review &amp; Approval</h2>
+      <p class="muted">Every generated redline appears here for review. Download the redline to review Track Changes directly in Word; the Change Summary shows every edit tied to its regulatory clause. ${canDecide ? "" : "Your role (" + state.user.role + ") can view and download but not sign off — sign in as qa1, quality_lead, or admin to approve/reject."}</p>
+      <table><thead><tr><th>Site</th><th>SOP</th><th>New Version</th><th>Status</th><th>Files</th><th>Decision (e-signature)</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>
+  `;
+}
+
+// ---------------- Audit ----------------
+async function auditView() {
+  if (!["admin", "quality_lead", "auditor"].includes(state.user.role)) {
+    return `<div class="card"><h2>Audit Trail</h2><p class="muted">Your role (${state.user.role}) does not have audit trail access. Sign in as admin, quality_lead, or auditor.</p></div>`;
+  }
+  const logs = await api("/audit");
+  const rows = logs.map(l => `
+    <tr>
+      <td class="muted">${l.timestamp}</td>
+      <td>${l.actor}</td>
+      <td>${l.action}</td>
+      <td>${l.entity_type} ${l.entity_id ? "#" + l.entity_id : ""}</td>
+      <td class="muted" style="max-width:280px;">${(l.details_json || "").slice(0, 200)}</td>
+    </tr>`).join("");
+  return `
+    <div class="card">
+      <h2>Audit Trail</h2>
+      <p class="muted">Immutable log of every action — required for inspection readiness (Section 4.10 / 9.2 of the platform spec).</p>
+      <table><thead><tr><th>Timestamp (UTC)</th><th>Actor</th><th>Action</th><th>Entity</th><th>Details</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>
+  `;
+}
+
+function siteLabel() {
+  const s = state.sites.find(s => s.id === state.currentSiteId);
+  return s ? `${s.code} — ${s.name}` : "";
+}
+
+function bindTabHandlers() {
+  const uploadBtn = document.getElementById("uploadSopBtn");
+  if (uploadBtn) uploadBtn.onclick = () => document.getElementById("uploadModal").classList.remove("hidden");
+  const cancelUpload = document.getElementById("cancelUpload");
+  if (cancelUpload) cancelUpload.onclick = () => document.getElementById("uploadModal").classList.add("hidden");
+  const submitUpload = document.getElementById("submitUpload");
+  if (submitUpload) submitUpload.onclick = doUploadSop;
+
+  const runRtmBtn = document.getElementById("runRtmBtn");
+  if (runRtmBtn) runRtmBtn.onclick = async () => {
+    runRtmBtn.disabled = true; runRtmBtn.textContent = "Running AI analysis…";
+    try { await api("/rtm/run-mapping", { method: "POST", body: JSON.stringify({ site_id: state.currentSiteId }) }); toast("RTM mapping complete."); renderTab(); }
+    catch (e) { toast("Error: " + e.message); runRtmBtn.disabled = false; runRtmBtn.textContent = "Run AI Gap Analysis for " + siteLabel(); }
+  };
+
+  const runCompareBtn = document.getElementById("runCompareBtn");
+  if (runCompareBtn) runCompareBtn.onclick = async () => {
+    const cat = document.getElementById("compareCategory").value;
+    if (!cat) { toast("Select a SOP category first."); return; }
+    try { await api("/comparison/run", { method: "POST", body: JSON.stringify({ sop_category: cat }) }); toast("Comparison complete."); renderTab(); }
+    catch (e) { toast("Error: " + e.message); }
+  };
+
+  document.querySelectorAll(".genRedlineBtn").forEach(btn => {
+    btn.onclick = async () => {
+      btn.disabled = true; btn.textContent = "Generating…";
+      try {
+        const res = await api(`/gaps/${btn.dataset.gap}/generate-redline`, { method: "POST", body: JSON.stringify({}) });
+        toast(`Redline generated (${res.new_version_label})${res.ai_mock ? " — offline heuristic mode" : ""}. See Review & Approval tab.`);
+        renderTab();
+      } catch (e) { toast("Error: " + e.message); btn.disabled = false; btn.textContent = "Generate Redline"; }
+    };
+  });
+
+  document.querySelectorAll(".ownerInput, .dateInput").forEach(inp => {
+    inp.onchange = async () => {
+      const gapId = inp.dataset.gap;
+      const field = inp.classList.contains("ownerInput") ? "owner" : "target_date";
+      try { await api(`/gaps/${gapId}`, { method: "PUT", body: JSON.stringify({ [field]: inp.value }) }); toast("Saved."); }
+      catch (e) { toast("Error: " + e.message); }
+    };
+  });
+
+  document.querySelectorAll(".dlBtn").forEach(btn => {
+    btn.onclick = async () => {
+      try {
+        const blob = await api(`/revisions/${btn.dataset.rev}/download/${btn.dataset.kind}`);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = `${btn.dataset.kind}_revision_${btn.dataset.rev}.docx`;
+        document.body.appendChild(a); a.click(); a.remove();
+      } catch (e) { toast("Error: " + e.message); }
+    };
+  });
+
+  document.querySelectorAll(".approveBtn, .rejectBtn").forEach(btn => {
+    btn.onclick = async () => {
+      const revId = btn.dataset.rev;
+      const sigInput = document.querySelector(`.sigInput[data-rev="${revId}"]`);
+      const signature_name = sigInput ? sigInput.value.trim() : "";
+      if (!signature_name) { toast("Type your full name in the signature box first."); return; }
+      const decision = btn.classList.contains("approveBtn") ? "Approved" : "Rejected";
+      try {
+        await api(`/revisions/${revId}/decision`, { method: "POST", body: JSON.stringify({ decision, signature_name }) });
+        toast(`Revision ${decision.toLowerCase()} and signed by ${signature_name}.`);
+        renderTab();
+      } catch (e) { toast("Error: " + e.message); }
+    };
+  });
+}
+
+async function doUploadSop() {
+  const fileInput = document.getElementById("f_file");
+  const file = fileInput.files[0];
+  if (!file) { toast("Choose a .docx file."); return; }
+  const sop_number = document.getElementById("f_sop_number").value.trim();
+  const title = document.getElementById("f_title").value.trim();
+  if (!sop_number || !title) { toast("SOP number and title are required."); return; }
+  const reader = new FileReader();
+  reader.onload = async () => {
+    const base64 = reader.result.split(",")[1];
+    try {
+      await api("/sops", {
+        method: "POST",
+        body: JSON.stringify({
+          site_id: state.currentSiteId, sop_number, title,
+          process_area: document.getElementById("f_process_area").value.trim(),
+          sop_category: document.getElementById("f_sop_category").value.trim(),
+          version_label: document.getElementById("f_version").value.trim() || "v1.0",
+          filename: file.name, file_base64: base64,
+        }),
+      });
+      toast("SOP uploaded.");
+      document.getElementById("uploadModal").classList.add("hidden");
+      renderTab();
+    } catch (e) { toast("Error: " + e.message); }
+  };
+  reader.readAsDataURL(file);
+}
+
+render();
+</script>
+</body>
+</html>

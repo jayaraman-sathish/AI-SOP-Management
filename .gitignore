@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+data/app.db
+data/uploads/*
+data/generated/*
+!data/uploads/.gitkeep
+!data/generated/.gitkeep
+.DS_Store
+node_modules/
+*.log

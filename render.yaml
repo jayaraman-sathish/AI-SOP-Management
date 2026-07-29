@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: sop-compliance-platform
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python seed.py && gunicorn -w 2 -b 0.0.0.0:$PORT app:app"
+    envVars:
+      - key: APP_JWT_SECRET
+        generateValue: true
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ANTHROPIC_MODEL
+        value: claude-sonnet-4-5-20250929
+    disk:
+      name: sop-data
+      mountPath: /opt/render/project/data
+      sizeGB: 1
