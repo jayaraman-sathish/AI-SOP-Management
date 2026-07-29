@@ -13,7 +13,9 @@ services:
         sync: false
       - key: ANTHROPIC_MODEL
         value: claude-sonnet-4-5-20250929
-    disk:
-      name: sop-data
-      mountPath: /opt/render/project/data
-      sizeGB: 1
+    # NOTE: Render's free plan does not support persistent disks. Without one,
+    # the SQLite database and any uploaded/generated files are wiped on every
+    # restart/redeploy (Render's filesystem is ephemeral on free) -- fine for
+    # a demo/pilot, not for real data. Upgrade this service to a paid plan and
+    # add a `disk:` block back once you're past the demo stage and have real
+    # SOPs to keep.
