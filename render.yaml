@@ -7,9 +7,10 @@ services:
     buildCommand: "pip install -r requirements.txt"
     # -w 1: free tier has only 512MB RAM; a single worker avoids two workers each
     # holding a large base64-decoded upload in memory at once and getting OOM-killed.
-    # --timeout 300: default gunicorn timeout is 30s, which large multi-file SOP
-    # package uploads (several MB each, +33% from base64) can easily exceed.
-    startCommand: "python seed.py && gunicorn -w 1 --timeout 300 -b 0.0.0.0:$PORT app:app"
+    # --timeout 600: default gunicorn timeout is 30s, which large multi-file SOP
+    # package uploads (several MB each, +33% from base64, up to 180MB) over a slow
+    # connection can easily exceed.
+    startCommand: "python seed.py && gunicorn -w 1 --timeout 600 -b 0.0.0.0:$PORT app:app"
     envVars:
       - key: APP_JWT_SECRET
         generateValue: true

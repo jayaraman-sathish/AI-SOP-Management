@@ -180,12 +180,44 @@ function shellView() {
     <div id="userBox">
       <span>${state.user.name} <span class="muted">(${state.user.role})</span></span>
       <select id="siteSwitcher">${siteOptions}</select>
+      ${state.user.role === "admin" ? `<button id="manageSitesBtn" class="btn small secondary">Manage Sites</button>` : ""}
       <button id="logoutBtn">Log out</button>
     </div>
   </header>
   <nav>${TABS.map(t => `<button data-tab="${t.id}" class="${state.tab === t.id ? "active" : ""}">${t.label}</button>`).join("")}</nav>
   <main id="mainContent"></main>
+  ${state.user.role === "admin" ? manageSitesModal() : ""}
   `;
+}
+
+function manageSitesModal() {
+  const rows = state.sites.map(s => `
+    <div class="row" style="justify-content:space-between; padding:8px 0; border-bottom:1px solid var(--border); margin-bottom:0;">
+      <div>
+        <b>${s.code}</b> — ${s.name}<br/>
+        <span class="muted">${[s.location, s.product_type, s.sterilization_method, s.markets].filter(Boolean).join(" · ") || "no details set"}</span>
+      </div>
+      <button class="btn small secondary deleteSiteBtn" data-site="${s.id}" data-code="${s.code}">Delete</button>
+    </div>`).join("") || `<p class="muted">No sites yet.</p>`;
+  return `
+  <div id="manageSitesModalBg" class="modal-bg hidden">
+    <div class="modal" style="width:560px;">
+      <h3>Manage Sites (Plants)</h3>
+      <p class="muted">Add your real plants here, and remove the seeded demo sites once you no longer need them (a site can only be deleted if it has no SOPs uploaded against it).</p>
+      <div id="sitesList">${rows}</div>
+      <h4 style="margin-top:16px;">Add a New Site</h4>
+      <div class="field"><label>Site Code</label><input id="new_site_code" placeholder="e.g. PLANT-1" /></div>
+      <div class="field"><label>Site Name</label><input id="new_site_name" placeholder="e.g. Hyderabad Formulation Plant" /></div>
+      <div class="field"><label>Location</label><input id="new_site_location" placeholder="e.g. Hyderabad, India" /></div>
+      <div class="field"><label>Product Type</label><input id="new_site_product_type" placeholder="e.g. Sterile Injectable" /></div>
+      <div class="field"><label>Sterilization Method</label><input id="new_site_sterilization" placeholder="e.g. Aseptic Fill-Finish" /></div>
+      <div class="field"><label>Markets</label><input id="new_site_markets" placeholder="e.g. US, EU, India" /></div>
+      <div class="row" style="justify-content:flex-end;">
+        <button class="btn secondary" id="closeSitesModal">Close</button>
+        <button class="btn" id="addSiteBtn">Add Site</button>
+      </div>
+    </div>
+  </div>`;
 }
 
 function attachShellHandlers() {
@@ -196,6 +228,48 @@ function attachShellHandlers() {
   });
   api("/health").then(h => { state.aiLive = h.ai_live; document.querySelector("header .sub").textContent =
     `Sterile / Injectable Manufacturing — Prototype (Flask + SQLite, AI: ${h.ai_live ? "live Claude API" : "offline heuristic mode"})`; }).catch(()=>{});
+
+  const manageSitesBtn = document.getElementById("manageSitesBtn");
+  if (manageSitesBtn) manageSitesBtn.onclick = () => document.getElementById("manageSitesModalBg").classList.remove("hidden");
+  const closeSitesModal = document.getElementById("closeSitesModal");
+  if (closeSitesModal) closeSitesModal.onclick = () => document.getElementById("manageSitesModalBg").classList.add("hidden");
+
+  const addSiteBtn = document.getElementById("addSiteBtn");
+  if (addSiteBtn) addSiteBtn.onclick = async () => {
+    const code = document.getElementById("new_site_code").value.trim();
+    const name = document.getElementById("new_site_name").value.trim();
+    if (!code || !name) { toast("Site code and name are required."); return; }
+    try {
+      await api("/sites", {
+        method: "POST",
+        body: JSON.stringify({
+          code, name,
+          location: document.getElementById("new_site_location").value.trim(),
+          product_type: document.getElementById("new_site_product_type").value.trim(),
+          sterilization_method: document.getElementById("new_site_sterilization").value.trim(),
+          markets: document.getElementById("new_site_markets").value.trim(),
+        }),
+      });
+      toast(`Site ${code} added.`);
+      state.sites = [];
+      await render();
+      document.getElementById("manageSitesModalBg").classList.remove("hidden");
+    } catch (e) { toast("Error: " + e.message); }
+  };
+
+  document.querySelectorAll(".deleteSiteBtn").forEach(btn => {
+    btn.onclick = async () => {
+      if (!confirm(`Delete site ${btn.dataset.code}? This only works if it has no SOPs uploaded.`)) return;
+      try {
+        await api(`/sites/${btn.dataset.site}`, { method: "DELETE" });
+        toast(`Site ${btn.dataset.code} deleted.`);
+        state.sites = [];
+        if (state.currentSiteId === parseInt(btn.dataset.site, 10)) state.currentSiteId = null;
+        await render();
+        document.getElementById("manageSitesModalBg").classList.remove("hidden");
+      } catch (e) { toast("Error: " + e.message); }
+    };
+  });
 }
 
 async function renderTab() {
@@ -258,7 +332,11 @@ async function sopsView() {
       <td>${s.version_label || "—"}</td>
       <td>${s.attachment_count ? `${s.attachment_count} file${s.attachment_count > 1 ? "s" : ""}` : "<span class='muted'>none</span>"}</td>
       <td>${s.uploaded_at ? s.uploaded_at.slice(0,10) : "—"}</td>
-    </tr>`).join("") || `<tr><td colspan="6" class="muted">No SOPs uploaded for this site yet.</td></tr>`;
+      <td>
+        <button class="btn small secondary viewFilesBtn" data-sop="${s.id}" data-number="${s.sop_number}">View / Download Files</button>
+        <button class="btn small secondary editSopBtn" data-sop="${s.id}" data-title="${(s.title||"").replace(/"/g,'&quot;')}" data-process="${(s.process_area||"").replace(/"/g,'&quot;')}" data-category="${(s.sop_category||"").replace(/"/g,'&quot;')}">Edit</button>
+      </td>
+    </tr>`).join("") || `<tr><td colspan="7" class="muted">No SOPs uploaded for this site yet.</td></tr>`;
   return `
     <div class="card">
       <h2>SOP Repository — ${siteLabel()}</h2>
@@ -266,10 +344,44 @@ async function sopsView() {
         <button class="btn" id="uploadSopBtn">Upload SOP Package</button>
         <span class="muted">Drop in the main SOP plus any annexures/formats together — AI gap analysis reads all of them.</span>
       </div>
-      <table><thead><tr><th>SOP Number</th><th>Title</th><th>Category</th><th>Version</th><th>Attachments</th><th>Uploaded</th></tr></thead><tbody>${rows}</tbody></table>
+      <p class="muted">No SOP Category set? Site Comparison and AI matching both need it — click <b>Edit</b> on a row to set or fix it without re-uploading.</p>
+      <table><thead><tr><th>SOP Number</th><th>Title</th><th>Category</th><th>Version</th><th>Attachments</th><th>Uploaded</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
     ${uploadModal()}
+    ${filesModal()}
+    ${editSopModal()}
   `;
+}
+
+function filesModal() {
+  return `
+  <div id="filesModalBg" class="modal-bg hidden">
+    <div class="modal" style="width:560px;">
+      <h3 id="filesModalTitle">Files</h3>
+      <div id="filesModalBody" class="muted">Loading…</div>
+      <div class="row" style="justify-content:flex-end;">
+        <button class="btn secondary" id="closeFilesModal">Close</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function editSopModal() {
+  return `
+  <div id="editModalBg" class="modal-bg hidden">
+    <div class="modal" style="width:520px;">
+      <h3>Edit SOP Details</h3>
+      <p class="muted">Updates the SOP's title, process area, and category without touching the uploaded files.</p>
+      <input type="hidden" id="edit_sop_id" />
+      <div class="field"><label>Title</label><input id="edit_title" /></div>
+      <div class="field"><label>Process Area</label><input id="edit_process_area" /></div>
+      <div class="field"><label>SOP Category (must match a regulatory requirement's category to be auto-matched — see RTM tab)</label><input id="edit_sop_category" /></div>
+      <div class="row" style="justify-content:flex-end;">
+        <button class="btn secondary" id="cancelEditSop">Cancel</button>
+        <button class="btn" id="saveEditSop">Save</button>
+      </div>
+    </div>
+  </div>`;
 }
 
 let pendingFiles = []; // [{file, id, doc_type}]
@@ -348,6 +460,7 @@ function uploadModal() {
 // ---------------- RTM ----------------
 async function rtmView() {
   const entries = await api("/rtm?site_id=" + state.currentSiteId);
+  const siteSops = await api("/sops?site_id=" + state.currentSiteId);
   const rows = entries.map(e => `
     <tr>
       <td>${e.req_code}<br/><span class="muted">${e.source}</span></td>
@@ -358,14 +471,23 @@ async function rtmView() {
         ${e.ai_proposed ? `<div><span class="badge ${e.ai_mock ? 'mock' : 'live'}">${e.ai_mock ? "AI mock" : "AI"}</span></div>` : e.confirmed_by ? `<div class="muted" style="font-size:10px;">confirmed by ${e.confirmed_by}</div>` : ""}
       </td>
       <td style="max-width:220px;">${e.rationale || ""}</td>
-    </tr>`).join("") || `<tr><td colspan="6" class="muted">No RTM entries yet — click "Run AI Gap Analysis" below.</td></tr>`;
+    </tr>`).join("") || `<tr><td colspan="6" class="muted">No RTM entries yet — pick SOP(s) below and click "Run AI Gap Analysis".</td></tr>`;
+  const sopChecklist = siteSops.map(s => `
+    <label style="display:inline-flex; align-items:center; gap:4px; margin:4px 10px 4px 0; font-size:13px;">
+      <input type="checkbox" class="rtmSopCheck" value="${s.id}" checked /> ${s.sop_number} <span class="muted">(${s.sop_category || "no category"})</span>
+    </label>`).join("") || `<p class="muted">No SOPs uploaded for this site yet — go to SOP Repository first.</p>`;
   return `
     <div class="card">
       <h2>Requirement Traceability Matrix — ${siteLabel()}</h2>
       ${state.aiLive ? "" : `<div class="ai-banner">⚠ Running in offline heuristic mode — no ANTHROPIC_API_KEY configured on the server. Coverage assessments below are placeholder keyword-overlap results, clearly flagged "AI mock". Set the key to get real semantic analysis.</div>`}
+      <div style="margin-bottom:10px;">
+        <label style="font-weight:700; font-size:13px;">SOPs to check (unchecked ones are excluded from this run):</label><br/>
+        ${sopChecklist}
+        ${siteSops.length > 1 ? `<div style="margin-top:4px;"><button class="btn small secondary" id="rtmSelectAll">Select all</button> <button class="btn small secondary" id="rtmSelectNone">Select none</button></div>` : ""}
+      </div>
       <div class="row">
-        <button class="btn" id="runRtmBtn">Run AI Gap Analysis for ${siteLabel()}</button>
-        <span class="muted">Assesses every regulatory requirement against this site's uploaded SOPs.</span>
+        <button class="btn" id="runRtmBtn" ${siteSops.length === 0 ? "disabled" : ""}>Run AI Gap Analysis for ${siteLabel()}</button>
+        <span class="muted">Assesses every regulatory requirement against the checked SOP(s) above.</span>
       </div>
       <table><thead><tr><th>Requirement</th><th>Clause</th><th>Text</th><th>Matched SOP</th><th>Status</th><th>Rationale</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
@@ -506,11 +628,92 @@ function bindTabHandlers() {
     };
   }
 
+  document.querySelectorAll(".viewFilesBtn").forEach(btn => {
+    btn.onclick = async () => {
+      document.getElementById("filesModalTitle").textContent = `Files — ${btn.dataset.number}`;
+      const body = document.getElementById("filesModalBody");
+      body.textContent = "Loading…";
+      document.getElementById("filesModalBg").classList.remove("hidden");
+      try {
+        const sop = await api(`/sops/${btn.dataset.sop}`);
+        const current = (sop.versions || []).find(v => v.is_current) || sop.versions[0];
+        if (!current) { body.innerHTML = `<p class="muted">No files found.</p>`; return; }
+        const attRows = (current.attachments || []).map(a => `
+          <div class="row" style="justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border); margin-bottom:0;">
+            <div>${a.filename} <span class="badge">${a.doc_type}</span></div>
+            <button class="btn small secondary fileDlBtn" data-kind="attachment" data-id="${a.id}" data-name="${a.filename}">Download</button>
+          </div>`).join("") || `<p class="muted">No annexures/formats attached.</p>`;
+        body.innerHTML = `
+          <div class="row" style="justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border); margin-bottom:0;">
+            <div>${current.filename} <span class="badge">Main SOP</span> <span class="muted">(${current.version_label})</span></div>
+            <button class="btn small secondary fileDlBtn" data-kind="version" data-id="${current.id}" data-name="${current.filename}">Download</button>
+          </div>
+          ${attRows}
+        `;
+        body.querySelectorAll(".fileDlBtn").forEach(dbtn => {
+          dbtn.onclick = async () => {
+            try {
+              const path = dbtn.dataset.kind === "version" ? `/sop_versions/${dbtn.dataset.id}/download` : `/sop_attachments/${dbtn.dataset.id}/download`;
+              const blob = await api(path);
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a");
+              a.href = url; a.download = dbtn.dataset.name;
+              document.body.appendChild(a); a.click(); a.remove();
+            } catch (e) { toast("Error: " + e.message); }
+          };
+        });
+      } catch (e) { body.innerHTML = `<p class="muted">Error loading files: ${e.message}</p>`; }
+    };
+  });
+  const closeFilesModal = document.getElementById("closeFilesModal");
+  if (closeFilesModal) closeFilesModal.onclick = () => document.getElementById("filesModalBg").classList.add("hidden");
+
+  document.querySelectorAll(".editSopBtn").forEach(btn => {
+    btn.onclick = () => {
+      document.getElementById("edit_sop_id").value = btn.dataset.sop;
+      document.getElementById("edit_title").value = btn.dataset.title || "";
+      document.getElementById("edit_process_area").value = btn.dataset.process || "";
+      document.getElementById("edit_sop_category").value = btn.dataset.category || "";
+      document.getElementById("editModalBg").classList.remove("hidden");
+    };
+  });
+  const cancelEditSop = document.getElementById("cancelEditSop");
+  if (cancelEditSop) cancelEditSop.onclick = () => document.getElementById("editModalBg").classList.add("hidden");
+  const saveEditSop = document.getElementById("saveEditSop");
+  if (saveEditSop) saveEditSop.onclick = async () => {
+    const id = document.getElementById("edit_sop_id").value;
+    const title = document.getElementById("edit_title").value.trim();
+    if (!title) { toast("Title is required."); return; }
+    try {
+      await api(`/sops/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          title,
+          process_area: document.getElementById("edit_process_area").value.trim(),
+          sop_category: document.getElementById("edit_sop_category").value.trim(),
+        }),
+      });
+      toast("SOP details updated.");
+      document.getElementById("editModalBg").classList.add("hidden");
+      renderTab();
+    } catch (e) { toast("Error: " + e.message); }
+  };
+
+  const rtmSelectAll = document.getElementById("rtmSelectAll");
+  if (rtmSelectAll) rtmSelectAll.onclick = () => document.querySelectorAll(".rtmSopCheck").forEach(c => c.checked = true);
+  const rtmSelectNone = document.getElementById("rtmSelectNone");
+  if (rtmSelectNone) rtmSelectNone.onclick = () => document.querySelectorAll(".rtmSopCheck").forEach(c => c.checked = false);
+
   const runRtmBtn = document.getElementById("runRtmBtn");
   if (runRtmBtn) runRtmBtn.onclick = async () => {
-    runRtmBtn.disabled = true; runRtmBtn.textContent = "Running AI analysis…";
-    try { await api("/rtm/run-mapping", { method: "POST", body: JSON.stringify({ site_id: state.currentSiteId }) }); toast("RTM mapping complete."); renderTab(); }
-    catch (e) { toast("Error: " + e.message); runRtmBtn.disabled = false; runRtmBtn.textContent = "Run AI Gap Analysis for " + siteLabel(); }
+    const sop_ids = Array.from(document.querySelectorAll(".rtmSopCheck:checked")).map(c => parseInt(c.value, 10));
+    if (!sop_ids.length) { toast("Check at least one SOP to run the analysis against."); return; }
+    runRtmBtn.disabled = true; runRtmBtn.textContent = "Running AI analysis… (this can take a minute or two)";
+    try {
+      await api("/rtm/run-mapping", { method: "POST", body: JSON.stringify({ site_id: state.currentSiteId, sop_ids }) });
+      toast("RTM mapping complete.");
+      renderTab();
+    } catch (e) { toast("Error: " + e.message); runRtmBtn.disabled = false; runRtmBtn.textContent = "Run AI Gap Analysis for " + siteLabel(); }
   };
 
   const runCompareBtn = document.getElementById("runCompareBtn");
@@ -589,12 +792,12 @@ async function doUploadSop() {
 
   const totalBytes = pendingFiles.reduce((sum, pf) => sum + pf.file.size, 0);
   const estimatedUploadMB = Math.round((totalBytes * 1.34) / 1024 / 1024); // base64 overhead
-  if (estimatedUploadMB > 90) {
-    toast(`This batch is ~${estimatedUploadMB}MB once encoded — over the 100MB server limit. Remove a large file (check sizes in the list above) or upload it separately.`);
+  if (estimatedUploadMB > 170) {
+    toast(`This batch is ~${estimatedUploadMB}MB once encoded — over the 180MB server limit. Remove a large file (check sizes in the list above) or upload it separately.`);
     return;
   }
   if (estimatedUploadMB > 20) {
-    toast(`Uploading ~${estimatedUploadMB}MB — this may take a minute or two on the free-tier server, please wait.`);
+    toast(`Uploading ~${estimatedUploadMB}MB — this can take several minutes on the free-tier server, please wait and don't close this tab.`);
   }
 
   const submitBtn = document.getElementById("submitUpload");

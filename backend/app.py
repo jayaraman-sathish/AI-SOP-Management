@@ -29,12 +29,13 @@ app = Flask(__name__)
 # Cap total request body size so an oversized SOP package (large scanned annexures,
 # embedded images, etc.) fails fast with a clear error instead of hanging until the
 # gunicorn worker timeout hits, or exhausting memory on a small free-tier instance.
-# 100MB comfortably covers a real 10+ file annexure/format package (main doc plus
-# several MB-sized annexures) plus ~33% base64 inflation, while a single gunicorn
-# worker (see render.yaml) keeps peak memory to one request's worth at a time on
-# Render's 512MB free-tier instance. Raise further (and move to a paid Render plan
-# with more RAM) only if SOPs routinely include very large embedded scans/images.
-app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
+# 180MB covers a large multi-plant annexure/format package plus ~33% base64
+# inflation. A single gunicorn worker (see render.yaml) keeps peak memory to one
+# request's worth at a time on Render's 512MB free-tier instance -- this is
+# already close to that instance's practical ceiling; if real SOP packages
+# routinely exceed this, the real fix is a paid Render plan with more RAM
+# (see README "Deploying"), not raising this number further.
+app.config["MAX_CONTENT_LENGTH"] = 180 * 1024 * 1024
 
 
 @app.errorhandler(413)
@@ -42,7 +43,7 @@ def too_large(_e):
     return jsonify({
         "error": "upload_too_large",
         "message": (
-            "This SOP package is too large for the current server limit (100MB total, "
+            "This SOP package is too large for the current server limit (180MB total, "
             "including base64 encoding overhead). Split large scanned annexures out, "
             "compress embedded images, or upload the oversized attachment separately."
         ),
@@ -175,6 +176,34 @@ def create_site():
     conn.close()
     db.log_audit(actor_label(), "create", "site", site_id, data)
     return jsonify({"id": site_id}), 201
+
+
+@app.route("/api/sites/<int:site_id>", methods=["DELETE"])
+@require_auth(roles=["admin"])
+def delete_site(site_id):
+    """Removes a site (e.g. one of the seeded demo sites) once it's no longer
+    needed. Refuses to delete a site that has SOPs uploaded against it, so a
+    misclick can't silently orphan real data -- reassign or delete those SOPs
+    first if you really need to remove a site that has content."""
+    conn = db.get_db()
+    site = conn.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
+    if not site:
+        conn.close()
+        return jsonify({"error": "not_found"}), 404
+    sop_count = conn.execute("SELECT COUNT(*) c FROM sops WHERE site_id=?", (site_id,)).fetchone()["c"]
+    if sop_count > 0:
+        conn.close()
+        return jsonify({
+            "error": "site_has_sops",
+            "message": f"This site has {sop_count} SOP(s) uploaded against it -- delete or reassign those first before removing the site.",
+        }), 400
+    conn.execute("DELETE FROM rtm_entries WHERE site_id=?", (site_id,))
+    conn.execute("DELETE FROM gaps WHERE site_id=?", (site_id,))
+    conn.execute("DELETE FROM sites WHERE id=?", (site_id,))
+    conn.commit()
+    conn.close()
+    db.log_audit(actor_label(), "delete", "site", site_id, {"code": site["code"], "name": site["name"]})
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +370,65 @@ def get_sop(sop_id):
     return jsonify(result)
 
 
+@app.route("/api/sops/<int:sop_id>", methods=["PATCH"])
+@require_auth(roles=["admin", "analyst", "site_owner"])
+def update_sop_metadata(sop_id):
+    """Edit an SOP's title/process_area/sop_category without re-uploading files.
+    Added specifically so a category can be set/corrected after the fact --
+    Site Comparison and RTM matching both key off sop_category, and real-world
+    uploads don't always get it right (or at all) on the first pass."""
+    data = request.get_json(force=True)
+    conn = db.get_db()
+    sop = conn.execute("SELECT * FROM sops WHERE id=?", (sop_id,)).fetchone()
+    if not sop:
+        conn.close()
+        return jsonify({"error": "not_found"}), 404
+
+    title = data.get("title", sop["title"])
+    process_area = data.get("process_area", sop["process_area"])
+    sop_category = data.get("sop_category", sop["sop_category"])
+    if not (title or "").strip():
+        conn.close()
+        return jsonify({"error": "title_required"}), 400
+
+    conn.execute(
+        "UPDATE sops SET title=?, process_area=?, sop_category=? WHERE id=?",
+        (title.strip(), (process_area or "").strip(), (sop_category or "").strip(), sop_id),
+    )
+    conn.commit()
+    conn.close()
+
+    db.log_audit(actor_label(), "edit_metadata", "sop", sop_id, {
+        "title": title, "process_area": process_area, "sop_category": sop_category,
+    })
+    return jsonify({"ok": True})
+
+
+@app.route("/api/sop_versions/<int:version_id>/download", methods=["GET"])
+@require_auth()
+def download_sop_version(version_id):
+    """Download the original uploaded main SOP document for a given version
+    (not a redline -- the file exactly as uploaded, so you can open/verify it)."""
+    conn = db.get_db()
+    version = conn.execute("SELECT * FROM sop_versions WHERE id=?", (version_id,)).fetchone()
+    conn.close()
+    if not version or not os.path.exists(version["filepath"]):
+        return jsonify({"error": "file_not_found"}), 404
+    return send_file(version["filepath"], as_attachment=True, download_name=version["filename"])
+
+
+@app.route("/api/sop_attachments/<int:attachment_id>/download", methods=["GET"])
+@require_auth()
+def download_sop_attachment(attachment_id):
+    """Download an original uploaded annexure/format attachment exactly as uploaded."""
+    conn = db.get_db()
+    attachment = conn.execute("SELECT * FROM sop_attachments WHERE id=?", (attachment_id,)).fetchone()
+    conn.close()
+    if not attachment or not os.path.exists(attachment["filepath"]):
+        return jsonify({"error": "file_not_found"}), 404
+    return send_file(attachment["filepath"], as_attachment=True, download_name=attachment["filename"])
+
+
 # ---------------------------------------------------------------------------
 # RTM: AI-assisted requirement-to-SOP mapping
 # ---------------------------------------------------------------------------
@@ -374,9 +462,20 @@ def list_rtm():
 @app.route("/api/rtm/run-mapping", methods=["POST"])
 @require_auth(roles=["admin", "analyst"])
 def run_rtm_mapping():
-    """Runs AI-assisted coverage assessment for every requirement against a site's SOP set."""
+    """Runs AI-assisted coverage assessment for every requirement against a site's SOP set.
+
+    Accepts an optional "sop_ids" list to restrict the run to specific SOPs at
+    the site (e.g. just the ones relevant to a particular process area) rather
+    than every SOP uploaded there -- useful both to narrow the analysis and to
+    keep the run shorter (each requirement still costs one AI call, so fewer
+    candidate SOPs in scope doesn't reduce call count, but it does keep results
+    focused and avoids the "let the model look at everything" fallback pulling
+    in unrelated SOPs). If omitted or empty, every current SOP at the site is
+    considered, matching the original site-wide behavior.
+    """
     data = request.get_json(force=True)
     site_id = data["site_id"]
+    requested_sop_ids = data.get("sop_ids") or []
     conn = db.get_db()
     site = conn.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
     if not site:
@@ -390,6 +489,12 @@ def run_rtm_mapping():
         WHERE sop.site_id = ?
     """, (site_id,)).fetchall()
     sops = db.rows_to_list(sop_rows)
+    if requested_sop_ids:
+        requested_set = {int(i) for i in requested_sop_ids}
+        sops = [s for s in sops if s["sop_id"] in requested_set]
+        if not sops:
+            conn.close()
+            return jsonify({"error": "no_matching_sops", "message": "None of the selected SOPs were found at this site (current version)."}), 400
     # Pull each SOP's combined text (main document + every annexure/format attachment)
     # once per SOP, so AI analysis considers the whole package, not just the main file.
     for s in sops:
