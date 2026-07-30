@@ -716,6 +716,37 @@ function siteLabel() {
   return s ? `${s.code} — ${s.name}` : "";
 }
 
+async function pollRtmJob(jobId, btn) {
+  // RTM runs can take a while against a live AI key (one call per requirement,
+  // 41 of them) -- long enough that Render's routing layer (and some browsers)
+  // will kill a connection held open that long. So the run happens server-side
+  // in a background thread and we poll for progress instead of waiting on one
+  // long request. See run_rtm_mapping in app.py for the full reasoning.
+  while (true) {
+    await new Promise(r => setTimeout(r, 2000));
+    let status;
+    try {
+      status = await api(`/rtm/run-mapping/${jobId}`);
+    } catch (e) {
+      toast("Lost track of the analysis job: " + e.message);
+      btn.disabled = false; btn.textContent = "Run AI Gap Analysis for " + siteLabel();
+      return;
+    }
+    if (status.status === "running") {
+      const progress = status.total ? ` (${status.done}/${status.total})` : "";
+      btn.textContent = `Running AI analysis…${progress}`;
+    } else if (status.status === "done") {
+      if (status.warning) toast(status.warning); else toast("RTM mapping complete.");
+      renderTab();
+      return;
+    } else if (status.status === "error") {
+      toast("RTM run failed: " + (status.error || "unknown error"));
+      btn.disabled = false; btn.textContent = "Run AI Gap Analysis for " + siteLabel();
+      return;
+    }
+  }
+}
+
 function bindTabHandlers() {
   const uploadBtn = document.getElementById("uploadSopBtn");
   if (uploadBtn) uploadBtn.onclick = () => { pendingFiles = []; renderFileList(); document.getElementById("uploadModal").classList.remove("hidden"); };
@@ -785,11 +816,10 @@ function bindTabHandlers() {
   if (runRtmBtn) runRtmBtn.onclick = async () => {
     const sop_ids = Array.from(document.querySelectorAll(".rtmSopCheck:checked")).map(c => parseInt(c.value, 10));
     if (!sop_ids.length) { toast("Check at least one SOP to run the analysis against."); return; }
-    runRtmBtn.disabled = true; runRtmBtn.textContent = "Running AI analysis… (this can take a minute or two)";
+    runRtmBtn.disabled = true; runRtmBtn.textContent = "Starting AI analysis…";
     try {
-      await api("/rtm/run-mapping", { method: "POST", body: JSON.stringify({ site_id: state.currentSiteId, sop_ids }) });
-      toast("RTM mapping complete.");
-      renderTab();
+      const start = await api("/rtm/run-mapping", { method: "POST", body: JSON.stringify({ site_id: state.currentSiteId, sop_ids }) });
+      await pollRtmJob(start.job_id, runRtmBtn);
     } catch (e) { toast("Error: " + e.message); runRtmBtn.disabled = false; runRtmBtn.textContent = "Run AI Gap Analysis for " + siteLabel(); }
   };
 

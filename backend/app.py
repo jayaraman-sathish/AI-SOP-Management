@@ -5,6 +5,7 @@ import hashlib
 import secrets
 import datetime
 import functools
+import threading
 
 import jwt
 from flask import Flask, request, jsonify, send_file, g, send_from_directory
@@ -21,6 +22,13 @@ GEN_DIR = os.path.join(DATA_DIR, "generated")
 FRONTEND_DIR = os.path.join(BASE_DIR, "..", "frontend")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(GEN_DIR, exist_ok=True)
+
+# In-memory job tracker for long-running RTM analysis runs (see run_rtm_mapping).
+# Deliberately not persisted -- a job that was mid-run when the process restarts
+# is simply gone, which is fine: the user just clicks "Run AI Gap Analysis"
+# again and any already-committed RTM entries from before the restart are
+# still there (each requirement commits as soon as it's assessed).
+RTM_JOBS = {}
 
 JWT_SECRET = os.environ.get("APP_JWT_SECRET", "dev-secret-change-me-in-production")
 
@@ -526,104 +534,141 @@ def list_rtm():
     return jsonify(db.rows_to_list(rows))
 
 
+def _run_rtm_job(job_id, site_id, requested_sop_ids, actor):
+    """Background worker for an RTM run -- see run_rtm_mapping for why this
+    doesn't run inline in the request. Runs in its own thread with its own DB
+    connection (sqlite3 connections aren't shared across threads); updates
+    RTM_JOBS[job_id] as it goes so the frontend can poll progress."""
+    job = RTM_JOBS[job_id]
+    conn = db.get_db()
+    try:
+        site = conn.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
+        if not site:
+            job.update(status="error", error="site_not_found")
+            return
+
+        requirements = conn.execute("SELECT * FROM requirements ORDER BY id").fetchall()
+        sop_rows = conn.execute("""
+            SELECT sop.id as sop_id, sop.sop_number, sop.title, sop.sop_category
+            FROM sops sop JOIN sop_versions sv ON sv.sop_id = sop.id AND sv.is_current = 1
+            WHERE sop.site_id = ?
+        """, (site_id,)).fetchall()
+        sops = db.rows_to_list(sop_rows)
+        if requested_sop_ids:
+            requested_set = {int(i) for i in requested_sop_ids}
+            sops = [s for s in sops if s["sop_id"] in requested_set]
+            if not sops:
+                job.update(status="error", error="no_matching_sops")
+                return
+        for s in sops:
+            s["full_text"] = db.full_sop_text(conn, s["sop_id"])
+
+        job.update(total=len(requirements), done=0)
+        results = []
+        failed = []
+        for req in requirements:
+            req_d = db.row_to_dict(req)
+            try:
+                candidates = [s for s in sops if (s["sop_category"] or "").strip().lower() == (req_d["sop_category"] or "").strip().lower()]
+                if not candidates:
+                    candidates = sops  # fall back: let the model/heuristic look at everything if no category tag matches
+                excerpts = [{"sop_id": s["sop_id"], "sop_number": s["sop_number"], "title": s["title"], "text": s["full_text"]} for s in candidates]
+
+                assessment = ai_service.assess_requirement_coverage(req_d, excerpts)
+
+                existing = conn.execute("SELECT id FROM rtm_entries WHERE requirement_id=? AND site_id=?", (req_d["id"], site_id)).fetchone()
+                sop_id = assessment.get("sop_id")
+                if existing:
+                    conn.execute(
+                        "UPDATE rtm_entries SET coverage_status=?, rationale=?, cited_text=?, ai_proposed=?, ai_mock=?, updated_at=?, confirmed_by=NULL, confirmed_at=NULL WHERE requirement_id=? AND site_id=?",
+                        (assessment["coverage_status"], assessment.get("rationale", ""), assessment.get("cited_text", ""), 1, int(bool(assessment.get("ai_mock"))), db.now(), req_d["id"], site_id),
+                    )
+                    entry_id = existing["id"]
+                    conn.execute("UPDATE rtm_entries SET sop_id=? WHERE id=?", (sop_id, entry_id))
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO rtm_entries (requirement_id, site_id, sop_id, coverage_status, rationale, cited_text, ai_proposed, ai_mock, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (req_d["id"], site_id, sop_id, assessment["coverage_status"], assessment.get("rationale", ""), assessment.get("cited_text", ""), 1, int(bool(assessment.get("ai_mock"))), db.now()),
+                    )
+                    entry_id = cur.lastrowid
+
+                # Auto-create/refresh a gap record for anything not fully covered.
+                if assessment["coverage_status"] != "Covered":
+                    existing_gap = conn.execute("SELECT id FROM gaps WHERE rtm_entry_id=?", (entry_id,)).fetchone()
+                    risk = _default_risk(req_d)
+                    desc = f"{assessment['coverage_status']} for {req_d['source']} {req_d['clause']} at {site['code']}: {assessment.get('rationale','')}"
+                    if not existing_gap:
+                        conn.execute(
+                            "INSERT INTO gaps (rtm_entry_id, site_id, requirement_id, description, risk_level, status, created_at, updated_at) VALUES (?,?,?,?,?, 'Open', ?, ?)",
+                            (entry_id, site_id, req_d["id"], desc, risk, db.now(), db.now()),
+                        )
+                    else:
+                        conn.execute("UPDATE gaps SET description=?, updated_at=? WHERE id=?", (desc, db.now(), existing_gap["id"]))
+
+                results.append({"requirement_id": req_d["id"], "req_code": req_d["req_code"], **assessment})
+                conn.commit()  # commit progress after each requirement so a later failure doesn't lose earlier work
+            except Exception as e:
+                # A single bad AI response or unexpected error must not take down the
+                # whole 41-requirement run -- record it, skip it, and keep going so
+                # the rest of the RTM still gets populated.
+                conn.rollback()
+                failed.append({"requirement_id": req_d["id"], "req_code": req_d["req_code"], "error": str(e)})
+            job.update(done=job["done"] + 1)
+
+        db.log_audit(actor, "run_rtm_mapping", "site", site_id, {"requirements_assessed": len(results), "failed": len(failed)})
+        job.update(status="done", results=results, failed=failed)
+    except Exception as e:
+        job.update(status="error", error=str(e))
+    finally:
+        conn.close()
+
+
 @app.route("/api/rtm/run-mapping", methods=["POST"])
 @require_auth(roles=["admin", "analyst"])
 def run_rtm_mapping():
-    """Runs AI-assisted coverage assessment for every requirement against a site's SOP set.
+    """Kicks off AI-assisted coverage assessment for every requirement against
+    a site's SOP set, in a background thread, and returns immediately with a
+    job_id to poll -- see GET /api/rtm/run-mapping/<job_id>.
+
+    This used to run synchronously inside the request and return the full
+    result set in one response. With a live Claude API key, a 41-requirement
+    run is 41 sequential AI calls -- easily 1-2+ minutes wall-clock -- and
+    Render's routing layer (and many browsers/proxies) will time out and kill
+    the connection well before that, which surfaced as "Request failed" in the
+    UI even though the run might have still been progressing server-side.
+    Returning immediately and polling avoids that entirely, regardless of how
+    long the underlying analysis takes.
 
     Accepts an optional "sop_ids" list to restrict the run to specific SOPs at
-    the site (e.g. just the ones relevant to a particular process area) rather
-    than every SOP uploaded there -- useful both to narrow the analysis and to
-    keep the run shorter (each requirement still costs one AI call, so fewer
-    candidate SOPs in scope doesn't reduce call count, but it does keep results
-    focused and avoids the "let the model look at everything" fallback pulling
-    in unrelated SOPs). If omitted or empty, every current SOP at the site is
-    considered, matching the original site-wide behavior.
+    the site rather than every SOP uploaded there. If omitted or empty, every
+    current SOP at the site is considered.
     """
     data = request.get_json(force=True)
     site_id = data["site_id"]
     requested_sop_ids = data.get("sop_ids") or []
-    conn = db.get_db()
-    site = conn.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
-    if not site:
-        conn.close()
-        return jsonify({"error": "site_not_found"}), 404
+    actor = actor_label()  # must capture here -- actor_label() reads Flask's request-local `g`, unavailable in the worker thread
 
-    requirements = conn.execute("SELECT * FROM requirements ORDER BY id").fetchall()
-    sop_rows = conn.execute("""
-        SELECT sop.id as sop_id, sop.sop_number, sop.title, sop.sop_category
-        FROM sops sop JOIN sop_versions sv ON sv.sop_id = sop.id AND sv.is_current = 1
-        WHERE sop.site_id = ?
-    """, (site_id,)).fetchall()
-    sops = db.rows_to_list(sop_rows)
-    if requested_sop_ids:
-        requested_set = {int(i) for i in requested_sop_ids}
-        sops = [s for s in sops if s["sop_id"] in requested_set]
-        if not sops:
-            conn.close()
-            return jsonify({"error": "no_matching_sops", "message": "None of the selected SOPs were found at this site (current version)."}), 400
-    # Pull each SOP's combined text (main document + every annexure/format attachment)
-    # once per SOP, so AI analysis considers the whole package, not just the main file.
-    for s in sops:
-        s["full_text"] = db.full_sop_text(conn, s["sop_id"])
+    job_id = secrets.token_hex(8)
+    RTM_JOBS[job_id] = {"status": "running", "site_id": site_id, "total": 0, "done": 0, "results": [], "failed": [], "error": None, "started_at": db.now()}
+    thread = threading.Thread(target=_run_rtm_job, args=(job_id, site_id, requested_sop_ids, actor), daemon=True)
+    thread.start()
+    return jsonify({"job_id": job_id, "status": "running"}), 202
 
-    results = []
-    failed = []
-    for req in requirements:
-        req_d = db.row_to_dict(req)
-        try:
-            candidates = [s for s in sops if (s["sop_category"] or "").strip().lower() == (req_d["sop_category"] or "").strip().lower()]
-            if not candidates:
-                candidates = sops  # fall back: let the model/heuristic look at everything if no category tag matches
-            excerpts = [{"sop_id": s["sop_id"], "sop_number": s["sop_number"], "title": s["title"], "text": s["full_text"]} for s in candidates]
 
-            assessment = ai_service.assess_requirement_coverage(req_d, excerpts)
-
-            existing = conn.execute("SELECT id FROM rtm_entries WHERE requirement_id=? AND site_id=?", (req_d["id"], site_id)).fetchone()
-            sop_id = assessment.get("sop_id")
-            if existing:
-                conn.execute(
-                    "UPDATE rtm_entries SET coverage_status=?, rationale=?, cited_text=?, ai_proposed=?, ai_mock=?, updated_at=?, confirmed_by=NULL, confirmed_at=NULL WHERE requirement_id=? AND site_id=?",
-                    (assessment["coverage_status"], assessment.get("rationale", ""), assessment.get("cited_text", ""), 1, int(bool(assessment.get("ai_mock"))), db.now(), req_d["id"], site_id),
-                )
-                entry_id = existing["id"]
-                conn.execute("UPDATE rtm_entries SET sop_id=? WHERE id=?", (sop_id, entry_id))
-            else:
-                cur = conn.execute(
-                    "INSERT INTO rtm_entries (requirement_id, site_id, sop_id, coverage_status, rationale, cited_text, ai_proposed, ai_mock, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (req_d["id"], site_id, sop_id, assessment["coverage_status"], assessment.get("rationale", ""), assessment.get("cited_text", ""), 1, int(bool(assessment.get("ai_mock"))), db.now()),
-                )
-                entry_id = cur.lastrowid
-
-            # Auto-create/refresh a gap record for anything not fully covered.
-            if assessment["coverage_status"] != "Covered":
-                existing_gap = conn.execute("SELECT id FROM gaps WHERE rtm_entry_id=?", (entry_id,)).fetchone()
-                risk = _default_risk(req_d)
-                desc = f"{assessment['coverage_status']} for {req_d['source']} {req_d['clause']} at {site['code']}: {assessment.get('rationale','')}"
-                if not existing_gap:
-                    conn.execute(
-                        "INSERT INTO gaps (rtm_entry_id, site_id, requirement_id, description, risk_level, status, created_at, updated_at) VALUES (?,?,?,?,?, 'Open', ?, ?)",
-                        (entry_id, site_id, req_d["id"], desc, risk, db.now(), db.now()),
-                    )
-                else:
-                    conn.execute("UPDATE gaps SET description=?, updated_at=? WHERE id=?", (desc, db.now(), existing_gap["id"]))
-
-            results.append({"requirement_id": req_d["id"], "req_code": req_d["req_code"], **assessment})
-            conn.commit()  # commit progress after each requirement so a later failure doesn't lose earlier work
-        except Exception as e:
-            # A single bad AI response or unexpected error must not take down the
-            # whole 41-requirement run -- record it, skip it, and keep going so
-            # the rest of the RTM still gets populated. This is the fix for RTM
-            # runs erroring out entirely partway through against real SOP data.
-            conn.rollback()
-            failed.append({"requirement_id": req_d["id"], "req_code": req_d["req_code"], "error": str(e)})
-
-    conn.close()
-    db.log_audit(actor_label(), "run_rtm_mapping", "site", site_id, {"requirements_assessed": len(results), "failed": len(failed)})
-    response = {"site_id": site_id, "results": results}
-    if failed:
-        response["failed"] = failed
-        response["warning"] = f"{len(failed)} of {len(requirements)} requirement(s) could not be assessed and were skipped -- see 'failed' for details. The rest completed normally."
+@app.route("/api/rtm/run-mapping/<job_id>", methods=["GET"])
+@require_auth()
+def rtm_job_status(job_id):
+    job = RTM_JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "job_not_found"}), 404
+    response = {"status": job["status"], "total": job["total"], "done": job["done"]}
+    if job["status"] == "done":
+        response["results"] = job["results"]
+        if job["failed"]:
+            response["failed"] = job["failed"]
+            response["warning"] = f"{len(job['failed'])} of {job['total']} requirement(s) could not be assessed and were skipped -- see 'failed' for details. The rest completed normally."
+    elif job["status"] == "error":
+        response["error"] = job["error"]
     return jsonify(response)
 
 
