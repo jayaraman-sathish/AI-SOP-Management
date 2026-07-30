@@ -163,6 +163,16 @@ CREATE TABLE IF NOT EXISTS audit_log (
     details_json TEXT,
     timestamp TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS error_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    endpoint TEXT,
+    message TEXT NOT NULL,
+    traceback TEXT,
+    context_json TEXT,
+    timestamp TEXT NOT NULL
+);
 """
 
 
@@ -182,6 +192,24 @@ def log_audit(actor, action, entity_type, entity_id=None, details=None):
     )
     conn.commit()
     conn.close()
+
+
+def log_error(source, message, traceback_text=None, endpoint=None, context=None):
+    """Persist a server-side error so it's visible in-app (Admin > Error Log)
+    instead of only in Render's server console, which the user has no easy
+    way to hand back to Claude other than a screenshot. Best-effort: if this
+    itself fails (e.g. DB locked), swallow it -- logging an error must never
+    raise a new one."""
+    try:
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO error_log (source, endpoint, message, traceback, context_json, timestamp) VALUES (?,?,?,?,?,?)",
+            (source, endpoint, message, traceback_text, json.dumps(context or {}), now()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def row_to_dict(row):

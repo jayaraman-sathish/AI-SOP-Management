@@ -181,13 +181,60 @@ function shellView() {
       <span>${state.user.name} <span class="muted">(${state.user.role})</span></span>
       <select id="siteSwitcher">${siteOptions}</select>
       ${state.user.role === "admin" ? `<button id="manageSitesBtn" class="btn small secondary">Manage Sites</button>` : ""}
+      ${state.user.role === "admin" ? `<button id="errorLogBtn" class="btn small secondary">Error Log</button>` : ""}
       <button id="logoutBtn">Log out</button>
     </div>
   </header>
   <nav>${TABS.map(t => `<button data-tab="${t.id}" class="${state.tab === t.id ? "active" : ""}">${t.label}</button>`).join("")}</nav>
   <main id="mainContent"></main>
   ${state.user.role === "admin" ? manageSitesModal() : ""}
+  ${state.user.role === "admin" ? errorLogModal() : ""}
   `;
+}
+
+function errorLogModal() {
+  return `
+  <div id="errorLogModalBg" class="modal-bg hidden">
+    <div class="modal" style="width:720px; max-height:80vh; overflow:auto;">
+      <h3>Error Log</h3>
+      <p class="muted">The last 100 server-side errors, most recent first -- covers unhandled request errors and any RTM requirement that failed to assess. Nothing here means nothing has failed. Copy an entry's message/traceback if you need to report a bug.</p>
+      <div id="errorLogList"><p class="muted">Loading…</p></div>
+      <div class="row" style="justify-content:flex-end;">
+        <button class="btn secondary" id="closeErrorLogModal">Close</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function escHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function openErrorLog() {
+  const bg = document.getElementById("errorLogModalBg");
+  bg.classList.remove("hidden");
+  const list = document.getElementById("errorLogList");
+  list.innerHTML = `<p class="muted">Loading…</p>`;
+  try {
+    const data = await api("/error-log");
+    if (!data.errors.length) {
+      list.innerHTML = `<p class="muted">No errors logged. Everything that's run so far has completed cleanly.</p>`;
+      return;
+    }
+    list.innerHTML = data.errors.map(e => `
+      <div style="border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:8px;">
+        <div style="display:flex; justify-content:space-between; gap:8px;">
+          <b>${escHtml(e.source)}</b>
+          <span class="muted" style="font-size:12px;">${escHtml(e.timestamp)}</span>
+        </div>
+        ${e.endpoint ? `<div class="muted" style="font-size:12px;">${escHtml(e.endpoint)}</div>` : ""}
+        <div style="margin-top:6px; font-family:monospace; font-size:13px; white-space:pre-wrap;">${escHtml(e.message)}</div>
+        ${e.context_json && e.context_json !== "{}" ? `<div class="muted" style="font-size:12px; margin-top:4px;">${escHtml(e.context_json)}</div>` : ""}
+        ${e.traceback ? `<details style="margin-top:6px;"><summary class="muted" style="cursor:pointer; font-size:12px;">Full traceback</summary><pre style="font-size:11px; overflow:auto;">${escHtml(e.traceback)}</pre></details>` : ""}
+      </div>`).join("");
+  } catch (err) {
+    list.innerHTML = `<p class="muted">Could not load the error log: ${err.message}</p>`;
+  }
 }
 
 function manageSitesModal() {
@@ -233,6 +280,11 @@ function attachShellHandlers() {
   if (manageSitesBtn) manageSitesBtn.onclick = () => document.getElementById("manageSitesModalBg").classList.remove("hidden");
   const closeSitesModal = document.getElementById("closeSitesModal");
   if (closeSitesModal) closeSitesModal.onclick = () => document.getElementById("manageSitesModalBg").classList.add("hidden");
+
+  const errorLogBtn = document.getElementById("errorLogBtn");
+  if (errorLogBtn) errorLogBtn.onclick = openErrorLog;
+  const closeErrorLogModal = document.getElementById("closeErrorLogModal");
+  if (closeErrorLogModal) closeErrorLogModal.onclick = () => document.getElementById("errorLogModalBg").classList.add("hidden");
 
   const addSiteBtn = document.getElementById("addSiteBtn");
   if (addSiteBtn) addSiteBtn.onclick = async () => {
@@ -315,7 +367,7 @@ async function dashboardView() {
   return `
     <div class="card">
       <h2>Program Overview</h2>
-      <p class="muted">${stats.total_requirements} regulatory requirements tracked (FDA 21 CFR 210/211, EU GMP Annex 1, ICH Q7/Q9/Q10, WHO GMP TRS 1044) across ${stats.sites.length} site(s).</p>
+      <p class="muted">${stats.total_requirements} regulatory requirements tracked (FDA 21 CFR 211, EU GMP Annex 1, ICH Q7/Q9/Q10, WHO GMP TRS 1044, USP &lt;790&gt;/&lt;1790&gt;, PDA TR 79, PIC/S PE 009) across ${stats.sites.length} site(s).</p>
     </div>
     ${cards}
   `;
@@ -728,8 +780,18 @@ async function pollRtmJob(jobId, btn) {
     try {
       status = await api(`/rtm/run-mapping/${jobId}`);
     } catch (e) {
-      toast("Lost track of the analysis job: " + e.message);
+      if (e.message === "job_not_found") {
+        // The server process that was running this job got replaced (a Render
+        // redeploy, a restart, etc.) -- the job tracking lives in memory and
+        // goes with it. Each requirement commits to the RTM table as soon as
+        // it's assessed though, so whatever completed before the interruption
+        // is still there. Show that instead of just dead-ending.
+        toast("The analysis was interrupted by a server restart -- showing whatever completed before that. Run it again to pick up the rest.");
+      } else {
+        toast("Lost track of the analysis job: " + e.message);
+      }
       btn.disabled = false; btn.textContent = "Run AI Gap Analysis for " + siteLabel();
+      renderTab();
       return;
     }
     if (status.status === "running") {

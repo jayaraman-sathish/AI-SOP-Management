@@ -48,6 +48,15 @@ REQUIREMENTS = [
 ("WHO GMP (TRS 1044, Annex 2)","§7","Sterilization","Sterilization method validation and routine monitoring (autoclave, dry heat, filtration, gas).","Sterilization Process Validation"),
 ("WHO GMP (TRS 1044, Annex 2)","§3","Personnel","Personnel qualification, gowning, and health monitoring for aseptic areas.","Gowning & Personnel Hygiene"),
 ("WHO GMP (TRS 1044, Annex 2)","§8","Quality Control","Finished product testing including sterility, pyrogen/endotoxin, and particulate matter testing.","QC Sterility & Endotoxin Testing"),
+# Added after a real customer review flagged that manual visual inspection SOPs
+# (the actual documents uploaded for AK/AS/AJ) reference no clause-level source
+# for their lux/AQL/defect-kit requirements -- these four close that gap so RTM
+# and the redline engine have something concrete to check those SOPs against,
+# instead of only the general sterile-manufacturing clauses above.
+("USP <790>","Visible Particulates in Injections","Manual Visual Inspection","100% visual inspection of every unit of an injectable product for visible particulate matter, using a qualified, validated inspection method; units with visible particulates must be rejected.","Visual Inspection (Manual)"),
+("USP <1790>","Visual Inspection of Injections","Manual Visual Inspection","Defines inspection conditions for manual inspection: light intensity ranges for clear/colorless (2000-3750 lux) and amber/colored (8000-10000 lux) containers, minimum inspection time per view (typically 5 seconds), and a formal AQL-based inspector qualification and periodic requalification program with defect classification (critical/major/minor).","Visual Inspection (Manual)"),
+("PDA TR 79","Points to Consider for Manual Visual Inspection","Manual Visual Inspection","Establishes program-level expectations for manual inspection: a physical defect-kit library that is controlled, identified, and traceable; initial and periodic inspector qualification against a validated AQL-based reference set; ongoing trending of inspector rejection rates; and documented investigation of any significant shift in inspection performance.","Visual Inspection (Manual)"),
+("PIC/S PE 009 (GMP Guide)","Annex 1 / Part I §2 & §6","Personnel Qualification & Sterile Product Inspection","Personnel engaged in sterile/injectable product handling and inspection must be initially and periodically qualified for their specific task, with training records and requalification traceable to a defined program -- substantively harmonized with EU GMP Annex 1 but tracked separately since not every site's quality system references PIC/S by name.","Gowning & Personnel Hygiene"),
 ]
 
 # These run on every app startup (see render.yaml's startCommand), so this is

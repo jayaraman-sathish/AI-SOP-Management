@@ -6,6 +6,7 @@ import secrets
 import datetime
 import functools
 import threading
+import traceback
 
 import jwt
 from flask import Flask, request, jsonify, send_file, g, send_from_directory
@@ -72,9 +73,15 @@ def handle_unexpected_error(e):
     if isinstance(e, HTTPException):
         return e
     app.logger.exception("Unhandled error")
+    db.log_error(
+        "unhandled_exception",
+        f"{type(e).__name__}: {e}",
+        traceback_text=traceback.format_exc(),
+        endpoint=f"{request.method} {request.path}",
+    )
     return jsonify({
         "error": "internal_error",
-        "message": f"Something went wrong processing that request ({type(e).__name__}: {e}). This has been logged; try again, and if it keeps happening, it needs a code fix.",
+        "message": f"Something went wrong processing that request ({type(e).__name__}: {e}). This has been logged to Admin > Error Log; try again, and if it keeps happening, it needs a code fix.",
     }), 500
 
 
@@ -187,6 +194,19 @@ def list_sites():
     rows = conn.execute("SELECT * FROM sites ORDER BY code").fetchall()
     conn.close()
     return jsonify(db.rows_to_list(rows))
+
+
+@app.route("/api/error-log", methods=["GET"])
+@require_auth(roles=["admin"])
+def get_error_log():
+    """Admin-only view of recent server-side errors -- lets the user (or
+    Claude, if they paste this back) see exactly what went wrong without
+    needing access to Render's own server console, which isn't something
+    Claude can reach directly."""
+    conn = db.get_db()
+    rows = conn.execute("SELECT * FROM error_log ORDER BY id DESC LIMIT 100").fetchall()
+    conn.close()
+    return jsonify({"errors": db.rows_to_list(rows)})
 
 
 @app.route("/api/sites", methods=["POST"])
@@ -613,12 +633,26 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor):
                 # the rest of the RTM still gets populated.
                 conn.rollback()
                 failed.append({"requirement_id": req_d["id"], "req_code": req_d["req_code"], "error": str(e)})
+                db.log_error(
+                    "rtm_requirement_assessment",
+                    f"{type(e).__name__}: {e}",
+                    traceback_text=traceback.format_exc(),
+                    endpoint="run_rtm_mapping (background job)",
+                    context={"site_id": site_id, "requirement_id": req_d["id"], "req_code": req_d["req_code"]},
+                )
             job.update(done=job["done"] + 1)
 
         db.log_audit(actor, "run_rtm_mapping", "site", site_id, {"requirements_assessed": len(results), "failed": len(failed)})
         job.update(status="done", results=results, failed=failed)
     except Exception as e:
         job.update(status="error", error=str(e))
+        db.log_error(
+            "rtm_job",
+            f"{type(e).__name__}: {e}",
+            traceback_text=traceback.format_exc(),
+            endpoint="run_rtm_mapping (background job)",
+            context={"site_id": site_id},
+        )
     finally:
         conn.close()
 
