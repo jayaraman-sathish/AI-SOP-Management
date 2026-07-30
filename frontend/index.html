@@ -162,10 +162,10 @@ function attachLoginHandlers() {
 const TABS = [
   { id: "dashboard", label: "Dashboard" },
   { id: "sops", label: "SOP Repository" },
-  { id: "rtm", label: "RTM" },
   { id: "comparison", label: "Site Comparison" },
   { id: "gaps", label: "Gaps & Redlines" },
   { id: "discovery", label: "Suggested Requirements" },
+  { id: "reports", label: "Reports" },
   { id: "revisions", label: "Review & Approval" },
   { id: "audit", label: "Audit Trail" },
 ];
@@ -331,10 +331,10 @@ async function renderTab() {
   try {
     if (state.tab === "dashboard") main.innerHTML = await dashboardView();
     else if (state.tab === "sops") main.innerHTML = await sopsView();
-    else if (state.tab === "rtm") main.innerHTML = await rtmView();
     else if (state.tab === "comparison") main.innerHTML = await comparisonView();
     else if (state.tab === "gaps") main.innerHTML = await gapsView();
     else if (state.tab === "discovery") main.innerHTML = await discoveryView();
+    else if (state.tab === "reports") main.innerHTML = await reportsView();
     else if (state.tab === "revisions") main.innerHTML = await revisionsView();
     else if (state.tab === "audit") main.innerHTML = await auditView();
     bindTabHandlers();
@@ -387,6 +387,7 @@ async function sopsView() {
       <td>${s.attachment_count ? `${s.attachment_count} file${s.attachment_count > 1 ? "s" : ""}` : "<span class='muted'>none</span>"}</td>
       <td>${s.uploaded_at ? s.uploaded_at.slice(0,10) : "—"}</td>
       <td>
+        <button class="btn small checkComplianceBtn" data-sop="${s.id}" data-number="${s.sop_number}">Check Compliance</button><br/>
         <button class="btn small secondary viewFilesBtn" data-sop="${s.id}" data-number="${s.sop_number}">View / Download Files</button>
         <button class="btn small secondary editSopBtn" data-sop="${s.id}" data-title="${(s.title||"").replace(/"/g,'&quot;')}" data-process="${(s.process_area||"").replace(/"/g,'&quot;')}" data-category="${(s.sop_category||"").replace(/"/g,'&quot;')}">Edit</button>
         <button class="btn small secondary discoverGapsBtn" data-sop="${s.id}" data-number="${s.sop_number}">Discover Additional Requirements</button>
@@ -399,8 +400,10 @@ async function sopsView() {
         <button class="btn" id="uploadSopBtn">Upload SOP Package</button>
         <span class="muted">Drop in the main SOP plus any annexures/formats together — AI gap analysis reads all of them.</span>
       </div>
+      ${state.aiLive ? "" : `<div class="ai-banner">⚠ Running in offline heuristic mode — no ANTHROPIC_API_KEY configured on the server. Compliance assessments below are placeholder keyword-overlap results, clearly flagged "AI mock". Set the key to get real semantic analysis.</div>`}
       <p class="muted">No SOP Category set? Site Comparison and AI matching both need it — click <b>Edit</b> on a row to set or fix it without re-uploading.</p>
-      <p class="muted"><b>Discover Additional Requirements</b> reads this SOP and suggests regulatory topics (USP, PDA, EU/WHO/FDA clauses) that aren't in the requirement library yet but this SOP's subject matter would typically need to address. These are unverified AI suggestions, not confirmed findings — review them in the Suggested Requirements tab before they count toward RTM.</p>
+      <p class="muted"><b>Check Compliance</b> assesses every requirement in the Requirement Library directly against this SOP's actual content and generates a downloadable Word Compliance Report (Compliant / Non-Compliant / Not Applicable to this SOP), logged in the Reports tab. A requirement this SOP simply doesn't cover the subject matter of is marked "Not Applicable" — not a finding against this document.</p>
+      <p class="muted"><b>Discover Additional Requirements</b> reads this SOP and suggests regulatory topics (USP, PDA, EU/WHO/FDA clauses) that aren't in the requirement library yet but this SOP's subject matter would typically need to address. These are unverified AI suggestions, not confirmed findings — review them in the Suggested Requirements tab before they count toward a Compliance Check.</p>
       <table><thead><tr><th>SOP Number</th><th>Title</th><th>Category</th><th>Version</th><th>Attachments</th><th>Uploaded</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
     ${uploadModal()}
@@ -540,7 +543,7 @@ function editSopModal() {
       <input type="hidden" id="edit_sop_id" />
       <div class="field"><label>Title</label><input id="edit_title" /></div>
       <div class="field"><label>Process Area</label><input id="edit_process_area" /></div>
-      <div class="field"><label>SOP Category (must match a regulatory requirement's category to be auto-matched — see RTM tab)</label><input id="edit_sop_category" /></div>
+      <div class="field"><label>SOP Category (helps the AI narrow relevant requirements; matching is content-driven, not category-exact)</label><input id="edit_sop_category" /></div>
       <div class="row" style="justify-content:flex-end;">
         <button class="btn secondary" id="cancelEditSop">Cancel</button>
         <button class="btn" id="saveEditSop">Save</button>
@@ -605,7 +608,7 @@ function uploadModal() {
       <div class="field"><label>SOP Number</label><input id="f_sop_number" placeholder="e.g. SOP-QC-014" /></div>
       <div class="field"><label>Title</label><input id="f_title" placeholder="e.g. Aseptic Process Simulation (Media Fill)" /></div>
       <div class="field"><label>Process Area</label><input id="f_process_area" placeholder="e.g. Aseptic Process Simulation" /></div>
-      <div class="field"><label>SOP Category (must match a regulatory requirement's category to be auto-matched — see RTM tab)</label><input id="f_sop_category" placeholder="e.g. Aseptic Process Simulation (Media Fill)" /></div>
+      <div class="field"><label>SOP Category (helps the AI narrow relevant requirements; matching is content-driven, not category-exact)</label><input id="f_sop_category" placeholder="e.g. Aseptic Process Simulation (Media Fill)" /></div>
       <div class="field"><label>Version Label</label><input id="f_version" placeholder="e.g. v1.0" value="v1.0" /></div>
       <div class="field">
         <label>Files — drag &amp; drop the main SOP plus any annexures/formats, or click to browse (.docx only, multiple allowed)</label>
@@ -624,43 +627,6 @@ function uploadModal() {
   </div>`;
 }
 
-// ---------------- RTM ----------------
-async function rtmView() {
-  const entries = await api("/rtm?site_id=" + state.currentSiteId);
-  const siteSops = await api("/sops?site_id=" + state.currentSiteId);
-  const rows = entries.map(e => `
-    <tr>
-      <td>${e.req_code}<br/><span class="muted">${e.source}</span></td>
-      <td>${e.clause}</td>
-      <td>${e.requirement_text}</td>
-      <td>${e.sop_number ? e.sop_number + "<br/><span class='muted'>" + e.sop_title + "</span>" : "<span class='muted'>none</span>"}</td>
-      <td><span class="${badgeClass(e.coverage_status)}">${e.coverage_status}</span>
-        ${e.ai_proposed ? `<div><span class="badge ${e.ai_mock ? 'mock' : 'live'}">${e.ai_mock ? "AI mock" : "AI"}</span></div>` : e.confirmed_by ? `<div class="muted" style="font-size:10px;">confirmed by ${e.confirmed_by}</div>` : ""}
-      </td>
-      <td style="max-width:220px;">${e.rationale || ""}</td>
-    </tr>`).join("") || `<tr><td colspan="6" class="muted">No RTM entries yet — pick SOP(s) below and click "Run AI Gap Analysis".</td></tr>`;
-  const sopChecklist = siteSops.map(s => `
-    <label style="display:inline-flex; align-items:center; gap:4px; margin:4px 10px 4px 0; font-size:13px;">
-      <input type="checkbox" class="rtmSopCheck" value="${s.id}" checked /> ${s.sop_number} <span class="muted">(${s.sop_category || "no category"})</span>
-    </label>`).join("") || `<p class="muted">No SOPs uploaded for this site yet — go to SOP Repository first.</p>`;
-  return `
-    <div class="card">
-      <h2>Requirement Traceability Matrix — ${siteLabel()}</h2>
-      ${state.aiLive ? "" : `<div class="ai-banner">⚠ Running in offline heuristic mode — no ANTHROPIC_API_KEY configured on the server. Coverage assessments below are placeholder keyword-overlap results, clearly flagged "AI mock". Set the key to get real semantic analysis.</div>`}
-      <div style="margin-bottom:10px;">
-        <label style="font-weight:700; font-size:13px;">SOPs to check (unchecked ones are excluded from this run):</label><br/>
-        ${sopChecklist}
-        ${siteSops.length > 1 ? `<div style="margin-top:4px;"><button class="btn small secondary" id="rtmSelectAll">Select all</button> <button class="btn small secondary" id="rtmSelectNone">Select none</button></div>` : ""}
-      </div>
-      <div class="row">
-        <button class="btn" id="runRtmBtn" ${siteSops.length === 0 ? "disabled" : ""}>Run AI Gap Analysis for ${siteLabel()}</button>
-        <span class="muted">Assesses every regulatory requirement against the checked SOP(s) above.</span>
-      </div>
-      <table><thead><tr><th>Requirement</th><th>Clause</th><th>Text</th><th>Matched SOP</th><th>Status</th><th>Rationale</th></tr></thead><tbody>${rows}</tbody></table>
-    </div>
-  `;
-}
-
 // ---------------- Comparison ----------------
 async function comparisonView() {
   const findings = await api("/comparison");
@@ -676,19 +642,51 @@ async function comparisonView() {
     </tr>`;
   }).join("") || `<tr><td colspan="5" class="muted">No comparisons run yet.</td></tr>`;
 
-  const categories = [...new Set((await api("/sops?site_id=")).map(s => s.sop_category).filter(Boolean))];
   const allSops = await api("/sops?site_id=");
-  const catOptions = [...new Set(allSops.map(s => s.sop_category).filter(Boolean))].map(c => `<option value="${c}">${c}</option>`).join("");
+  const bySite = {};
+  allSops.forEach(s => { (bySite[s.site_code || "—"] = bySite[s.site_code || "—"] || []).push(s); });
+  const checklist = Object.keys(bySite).sort().map(code => `
+    <div style="margin-bottom:8px;">
+      <b style="font-size:12px;">${code}</b><br/>
+      ${bySite[code].map(s => `
+        <label style="display:inline-flex; align-items:center; gap:4px; margin:2px 10px 2px 0; font-size:13px;">
+          <input type="checkbox" class="compareSopCheck" value="${s.id}" /> ${s.sop_number} <span class="muted">(${s.sop_category || "no category"})</span>
+        </label>`).join("")}
+    </div>`).join("") || `<p class="muted">No SOPs uploaded anywhere yet.</p>`;
 
   return `
     <div class="card">
       <h2>Site-to-Site Comparison</h2>
-      <p class="muted">This looks across <b>every plant</b>, not just the one selected in the top-right switcher — pick a category below and it pulls in that category's SOP from any plant that has one. Compares SOPs sharing the same category across sites and classifies each difference (needs the same SOP category uploaded at 2+ sites).</p>
+      <p class="muted">Browse every SOP uploaded across all plants below and explicitly check the specific SOPs you want compared (select at least 2) — this no longer auto-pulls every SOP sharing a category. On submit, the system compares only what you selected, lists concrete differences, and generates a downloadable Comparison Report (logged in the Reports tab).</p>
+      ${state.aiLive ? "" : `<div class="ai-banner">⚠ Running in offline heuristic mode — no ANTHROPIC_API_KEY configured on the server. Comparison findings below are placeholder results, clearly flagged "AI mock".</div>`}
+      <div style="margin-bottom:10px;">${checklist}</div>
       <div class="row">
-        <select id="compareCategory"><option value="">Select SOP category…</option>${catOptions}</select>
-        <button class="btn" id="runCompareBtn">Run Comparison</button>
+        <button class="btn" id="runCompareBtn">Compare Selected SOPs</button>
+        <span class="muted">Select 2 or more SOPs above, from any plant(s), to compare.</span>
       </div>
       <table><thead><tr><th>Category</th><th>Process Step</th><th>Site Values</th><th>Classification</th><th>Note</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>
+  `;
+}
+
+// ---------------- Reports ----------------
+async function reportsView() {
+  const allReports = await api("/reports");
+  const rows = allReports.map(r => `
+    <tr>
+      <td>${r.report_type === "compliance_check" ? "Compliance Check" : r.report_type === "comparison" ? "Site Comparison" : r.report_type}</td>
+      <td>${r.title}</td>
+      <td>${[r.site_code, r.sop_number].filter(Boolean).join(" — ") || "<span class='muted'>multiple / all sites</span>"}</td>
+      <td>${(r.created_at || "").slice(0,16).replace("T", " ")}</td>
+      <td>${r.created_by || ""}</td>
+      <td><button class="btn small secondary reportDlBtn" data-report="${r.id}" data-title="${(r.title||"").replace(/"/g,'&quot;')}">Download</button></td>
+    </tr>`).join("") || `<tr><td colspan="6" class="muted">No reports generated yet — run a Check Compliance or Site Comparison first.</td></tr>`;
+  return `
+    <div class="card">
+      <h2>Reports</h2>
+      <p class="muted">Every Compliance Report (from SOP Repository → Check Compliance) and Comparison Report (from Site Comparison) is listed here, across all plants, and stays downloadable independent of whether the run that produced it is still on screen.</p>
+      <p class="muted">Known limitation: Render's free tier has no persistent disk — a generated report file is wiped on the next redeploy. The row below will remain, but downloading it will show a clear message to re-run the check if that's happened.</p>
+      <table><thead><tr><th>Type</th><th>Title</th><th>Scope</th><th>Generated</th><th>By</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
   `;
 }
@@ -705,11 +703,11 @@ async function gapsView() {
       <td><input class="ownerInput" data-gap="${g.id}" value="${g.owner || ""}" placeholder="owner" style="width:90px;" /></td>
       <td><input class="dateInput" data-gap="${g.id}" type="date" value="${g.target_date || ""}" /></td>
       <td>${g.status !== "Closed" ? `<button class="btn small genRedlineBtn" data-gap="${g.id}">Generate Redline</button>` : "<span class='muted'>Closed</span>"}</td>
-    </tr>`).join("") || `<tr><td colspan="7" class="muted">No open gaps — run the RTM gap analysis first.</td></tr>`;
+    </tr>`).join("") || `<tr><td colspan="7" class="muted">No open gaps — run Check Compliance on a SOP in SOP Repository first.</td></tr>`;
   return `
     <div class="card">
       <h2>Gaps & AI-Assisted Redlining — ${siteLabel()}</h2>
-      <p class="muted">Every non-"Covered" RTM entry becomes a gap here. Generating a redline produces a Word file with native Track Changes enabled, plus a matching Change Summary — both land in the Review &amp; Approval tab.</p>
+      <p class="muted">Every non-"Covered" result from a Check Compliance run becomes a gap here. Generating a redline produces a Word file with native Track Changes enabled, plus a matching Change Summary — both land in the Review &amp; Approval tab.</p>
       <table><thead><tr><th>Risk</th><th>Requirement</th><th>Description</th><th>Status</th><th>Owner</th><th>Target Date</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
   `;
@@ -809,12 +807,12 @@ function siteLabel() {
   return s ? `${s.code} — ${s.name}` : "";
 }
 
-async function pollRtmJob(jobId, btn) {
-  // RTM runs can take a while against a live AI key (one call per requirement,
-  // 41 of them) -- long enough that Render's routing layer (and some browsers)
-  // will kill a connection held open that long. So the run happens server-side
-  // in a background thread and we poll for progress instead of waiting on one
-  // long request. See run_rtm_mapping in app.py for the full reasoning.
+async function pollRtmJob(jobId, btn, resetLabel) {
+  // Compliance checks can take a while against a live AI key (one call per
+  // requirement, 45+ of them) -- long enough that Render's routing layer (and
+  // some browsers) will kill a connection held open that long. So the run
+  // happens server-side in a background thread and we poll for progress
+  // instead of waiting on one long request. See run_rtm_mapping in app.py.
   while (true) {
     await new Promise(r => setTimeout(r, 2000));
     let status;
@@ -827,24 +825,27 @@ async function pollRtmJob(jobId, btn) {
         // goes with it. Each requirement commits to the RTM table as soon as
         // it's assessed though, so whatever completed before the interruption
         // is still there. Show that instead of just dead-ending.
-        toast("The analysis was interrupted by a server restart -- showing whatever completed before that. Run it again to pick up the rest.");
+        toast("The analysis was interrupted by a server restart -- showing whatever completed before that. Run Check Compliance again to pick up the rest.");
       } else {
         toast("Lost track of the analysis job: " + e.message);
       }
-      btn.disabled = false; btn.textContent = "Run AI Gap Analysis for " + siteLabel();
+      btn.disabled = false; btn.textContent = resetLabel;
       renderTab();
       return;
     }
     if (status.status === "running") {
       const progress = status.total ? ` (${status.done}/${status.total})` : "";
-      btn.textContent = `Running AI analysis…${progress}`;
+      btn.textContent = `Checking compliance…${progress}`;
     } else if (status.status === "done") {
-      if (status.warning) toast(status.warning); else toast("RTM mapping complete.");
+      if (status.warning) toast(status.warning);
+      if (status.report_id) toast("Compliance check complete — report ready in the Reports tab.");
+      else toast("Compliance check complete.");
+      btn.disabled = false; btn.textContent = resetLabel;
       renderTab();
       return;
     } else if (status.status === "error") {
-      toast("RTM run failed: " + (status.error || "unknown error"));
-      btn.disabled = false; btn.textContent = "Run AI Gap Analysis for " + siteLabel();
+      toast("Compliance check failed: " + (status.error || "unknown error"));
+      btn.disabled = false; btn.textContent = resetLabel;
       return;
     }
   }
@@ -962,35 +963,47 @@ function bindTabHandlers() {
             requirement_text: formRow.querySelector(".promote_text").value.trim(),
           }),
         });
-        toast(`Added to the library as ${res.req_code}. Future RTM runs will check against it.`);
+        toast(`Added to the library as ${res.req_code}. Future Check Compliance runs will check against it.`);
         renderTab();
       } catch (e) { toast("Error: " + e.message); btn.disabled = false; btn.textContent = "Confirm Add to Library"; }
     };
   });
 
-  const rtmSelectAll = document.getElementById("rtmSelectAll");
-  if (rtmSelectAll) rtmSelectAll.onclick = () => document.querySelectorAll(".rtmSopCheck").forEach(c => c.checked = true);
-  const rtmSelectNone = document.getElementById("rtmSelectNone");
-  if (rtmSelectNone) rtmSelectNone.onclick = () => document.querySelectorAll(".rtmSopCheck").forEach(c => c.checked = false);
-
-  const runRtmBtn = document.getElementById("runRtmBtn");
-  if (runRtmBtn) runRtmBtn.onclick = async () => {
-    const sop_ids = Array.from(document.querySelectorAll(".rtmSopCheck:checked")).map(c => parseInt(c.value, 10));
-    if (!sop_ids.length) { toast("Check at least one SOP to run the analysis against."); return; }
-    runRtmBtn.disabled = true; runRtmBtn.textContent = "Starting AI analysis…";
-    try {
-      const start = await api("/rtm/run-mapping", { method: "POST", body: JSON.stringify({ site_id: state.currentSiteId, sop_ids }) });
-      await pollRtmJob(start.job_id, runRtmBtn);
-    } catch (e) { toast("Error: " + e.message); runRtmBtn.disabled = false; runRtmBtn.textContent = "Run AI Gap Analysis for " + siteLabel(); }
-  };
+  document.querySelectorAll(".checkComplianceBtn").forEach(btn => {
+    btn.onclick = async () => {
+      const resetLabel = "Check Compliance";
+      btn.disabled = true; btn.textContent = "Starting AI analysis…";
+      try {
+        const start = await api("/rtm/run-mapping", { method: "POST", body: JSON.stringify({ site_id: state.currentSiteId, sop_ids: [parseInt(btn.dataset.sop, 10)] }) });
+        await pollRtmJob(start.job_id, btn, resetLabel);
+      } catch (e) { toast("Error: " + e.message); btn.disabled = false; btn.textContent = resetLabel; }
+    };
+  });
 
   const runCompareBtn = document.getElementById("runCompareBtn");
   if (runCompareBtn) runCompareBtn.onclick = async () => {
-    const cat = document.getElementById("compareCategory").value;
-    if (!cat) { toast("Select a SOP category first."); return; }
-    try { await api("/comparison/run", { method: "POST", body: JSON.stringify({ sop_category: cat }) }); toast("Comparison complete."); renderTab(); }
-    catch (e) { toast("Error: " + e.message); }
+    const sop_ids = Array.from(document.querySelectorAll(".compareSopCheck:checked")).map(c => parseInt(c.value, 10));
+    if (sop_ids.length < 2) { toast("Select at least 2 SOPs to compare."); return; }
+    runCompareBtn.disabled = true; runCompareBtn.textContent = "Comparing…";
+    try {
+      const res = await api("/comparison/run", { method: "POST", body: JSON.stringify({ sop_ids }) });
+      toast(res.report_id ? "Comparison complete — report ready in the Reports tab." : "Comparison complete.");
+      renderTab();
+    } catch (e) { toast("Error: " + e.message); }
+    runCompareBtn.disabled = false; runCompareBtn.textContent = "Compare Selected SOPs";
   };
+
+  document.querySelectorAll(".reportDlBtn").forEach(btn => {
+    btn.onclick = async () => {
+      try {
+        const blob = await api(`/reports/${btn.dataset.report}/download`);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = `${btn.dataset.title || "report"}.docx`;
+        document.body.appendChild(a); a.click(); a.remove();
+      } catch (e) { toast("Error: " + (e.message || "could not download this report")); }
+    };
+  });
 
   document.querySelectorAll(".genRedlineBtn").forEach(btn => {
     btn.onclick = async () => {
@@ -1001,7 +1014,7 @@ function bindTabHandlers() {
         renderTab();
       } catch (e) {
         if (e.message === "no_target_sop_identified") {
-          toast("Can't redline this — no SOP has been uploaded for this gap's category yet. Upload the relevant SOP first, then re-run RTM.");
+          toast("Can't redline this — no SOP has been uploaded for this gap's category yet. Upload the relevant SOP first, then re-run Check Compliance.");
         } else {
           toast("Error: " + e.message);
         }

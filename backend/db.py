@@ -179,6 +179,20 @@ CREATE TABLE IF NOT EXISTS error_log (
 -- `requirements`/`rtm_entries`: these are unverified candidates an AI noticed,
 -- not vetted regulatory clauses, and must never be treated as an official RTM
 -- finding until a human reviews and promotes one into the real library.
+-- Downloadable reports generated from a compliance check (per-SOP RTM run) or
+-- a site comparison. Lets a user come back and download a past result
+-- instead of it only existing as a live on-screen table.
+CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_type TEXT NOT NULL,
+    site_id INTEGER,
+    sop_id INTEGER,
+    title TEXT NOT NULL,
+    filepath TEXT NOT NULL,
+    created_by TEXT,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS discovery_candidates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     sop_id INTEGER NOT NULL REFERENCES sops(id),

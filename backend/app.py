@@ -15,6 +15,7 @@ import db
 import ai_service
 import docx_service
 import summary_service
+import report_service
 
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = db.DATA_DIR
@@ -773,7 +774,11 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor):
                     else:
                         conn.execute("UPDATE gaps SET description=?, updated_at=? WHERE id=?", (desc, db.now(), existing_gap["id"]))
 
-                results.append({"requirement_id": req_d["id"], "req_code": req_d["req_code"], **assessment})
+                results.append({
+                    "requirement_id": req_d["id"], "req_code": req_d["req_code"],
+                    "source": req_d["source"], "clause": req_d["clause"], "requirement_text": req_d["requirement_text"],
+                    **assessment,
+                })
                 conn.commit()  # commit progress after each requirement so a later failure doesn't lose earlier work
             except Exception as e:
                 # A single bad AI response or unexpected error must not take down the
@@ -791,7 +796,31 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor):
             job.update(done=job["done"] + 1)
 
         db.log_audit(actor, "run_rtm_mapping", "site", site_id, {"requirements_assessed": len(results), "failed": len(failed)})
-        job.update(status="done", results=results, failed=failed)
+
+        # Generate the downloadable Compliance Report and log it so it shows up
+        # in the Reports tab -- the on-screen results only last as long as this
+        # job/page does, the report persists (until the next Render redeploy
+        # wipes local files, same limitation as everything else generated here).
+        report_id = None
+        try:
+            report_sop = sops[0] if len(sops) == 1 else {"sop_number": "Multiple SOPs", "title": f"{len(sops)} SOPs checked", "sop_category": ""}
+            stored_name = f"compliance_report_site{site_id}_{secrets.token_hex(4)}.docx"
+            report_path = os.path.join(GEN_DIR, stored_name)
+            report_service.generate_compliance_report(
+                report_path, report_sop, dict(site), results,
+                ai_mock_any=any(r.get("ai_mock") for r in results),
+            )
+            title = f"Compliance Report — {report_sop['sop_number']} — {site['code']}"
+            cur = conn.execute(
+                "INSERT INTO reports (report_type, site_id, sop_id, title, filepath, created_by, created_at) VALUES (?,?,?,?,?,?,?)",
+                ("compliance_check", site_id, sops[0]["sop_id"] if len(sops) == 1 else None, title, report_path, actor, db.now()),
+            )
+            conn.commit()
+            report_id = cur.lastrowid
+        except Exception as e:
+            db.log_error("compliance_report_generation", f"{type(e).__name__}: {e}", traceback_text=traceback.format_exc(), context={"site_id": site_id})
+
+        job.update(status="done", results=results, failed=failed, report_id=report_id)
     except Exception as e:
         job.update(status="error", error=str(e))
         db.log_error(
@@ -831,7 +860,7 @@ def run_rtm_mapping():
     actor = actor_label()  # must capture here -- actor_label() reads Flask's request-local `g`, unavailable in the worker thread
 
     job_id = secrets.token_hex(8)
-    RTM_JOBS[job_id] = {"status": "running", "site_id": site_id, "total": 0, "done": 0, "results": [], "failed": [], "error": None, "started_at": db.now()}
+    RTM_JOBS[job_id] = {"status": "running", "site_id": site_id, "total": 0, "done": 0, "results": [], "failed": [], "error": None, "report_id": None, "started_at": db.now()}
     thread = threading.Thread(target=_run_rtm_job, args=(job_id, site_id, requested_sop_ids, actor), daemon=True)
     thread.start()
     return jsonify({"job_id": job_id, "status": "running"}), 202
@@ -846,6 +875,7 @@ def rtm_job_status(job_id):
     response = {"status": job["status"], "total": job["total"], "done": job["done"]}
     if job["status"] == "done":
         response["results"] = job["results"]
+        response["report_id"] = job.get("report_id")
         if job["failed"]:
             response["failed"] = job["failed"]
             response["warning"] = f"{len(job['failed'])} of {job['total']} requirement(s) could not be assessed and were skipped -- see 'failed' for details. The rest completed normally."
@@ -883,31 +913,66 @@ def _default_risk(requirement):
 @app.route("/api/comparison/run", methods=["POST"])
 @require_auth(roles=["admin", "analyst"])
 def run_comparison():
+    """User explicitly picks which specific SOPs to compare (across any plants),
+    rather than the system auto-pulling every SOP that happens to share a
+    category tag. Requires at least 2 SOPs; they don't have to share a category
+    -- the AI reads the actual content and reports concrete differences (or, if
+    the documents genuinely aren't comparable, says so in the findings)."""
     data = request.get_json(force=True)
-    sop_category = data["sop_category"]
+    sop_ids = data.get("sop_ids") or []
+    if len(sop_ids) < 2:
+        return jsonify({"error": "select_at_least_two_sops"}), 400
+
     conn = db.get_db()
-    rows = conn.execute("""
-        SELECT sites.code as site_code, sites.name as site_name, sop.sop_number, sop.title, sv.extracted_text
+    placeholders = ",".join("?" for _ in sop_ids)
+    rows = conn.execute(f"""
+        SELECT sop.id as sop_id, sites.code as site_code, sites.name as site_name,
+               sop.sop_number, sop.title, sop.sop_category
         FROM sops sop
         JOIN sites ON sites.id = sop.site_id
-        JOIN sop_versions sv ON sv.sop_id = sop.id AND sv.is_current = 1
-        WHERE sop.sop_category = ?
-    """, (sop_category,)).fetchall()
-    site_sops = [{"site_code": r["site_code"], "site_name": r["site_name"], "sop_number": r["sop_number"], "title": r["title"], "text": r["extracted_text"] or ""} for r in rows]
-    if len(site_sops) < 2:
+        WHERE sop.id IN ({placeholders})
+    """, sop_ids).fetchall()
+    if len(rows) < 2:
         conn.close()
-        return jsonify({"error": "need_at_least_two_sites_with_this_sop_category", "found": len(site_sops)}), 400
+        return jsonify({"error": "one_or_more_selected_sops_not_found"}), 400
 
-    result = ai_service.compare_sops_across_sites(sop_category, site_sops)
+    site_sops = []
+    for r in rows:
+        site_sops.append({
+            "site_code": r["site_code"], "site_name": r["site_name"],
+            "sop_number": r["sop_number"], "title": r["title"],
+            "text": db.full_sop_text(conn, r["sop_id"]),
+        })
+    categories = sorted({r["sop_category"] for r in rows if r["sop_category"]})
+    label = categories[0] if len(categories) == 1 else (", ".join(categories) if categories else "Selected SOPs")
+
+    result = ai_service.compare_sops_across_sites(label, site_sops)
     for finding in result["findings"]:
         conn.execute(
             "INSERT INTO comparison_findings (sop_category, process_step, site_values_json, classification, note, ai_mock, created_at) VALUES (?,?,?,?,?,?,?)",
-            (sop_category, finding.get("process_step", ""), __import__("json").dumps(finding.get("site_values", {})),
+            (label, finding.get("process_step", ""), __import__("json").dumps(finding.get("site_values", {})),
              finding.get("classification", "Best-Practice Divergence"), finding.get("note", ""), int(bool(result["ai_mock"])), db.now()),
         )
+
+    report_id = None
+    try:
+        sops_compared = [{"site_code": r["site_code"], "site_name": r["site_name"], "sop_number": r["sop_number"], "title": r["title"]} for r in rows]
+        stored_name = f"comparison_report_{secrets.token_hex(4)}.docx"
+        report_path = os.path.join(GEN_DIR, stored_name)
+        report_service.generate_comparison_report(report_path, sops_compared, result["findings"], ai_mock=result.get("ai_mock", False))
+        title = f"Comparison Report — {', '.join(r['sop_number'] for r in rows)}"
+        cur = conn.execute(
+            "INSERT INTO reports (report_type, site_id, sop_id, title, filepath, created_by, created_at) VALUES (?,?,?,?,?,?,?)",
+            ("comparison", None, None, title, report_path, actor_label(), db.now()),
+        )
+        report_id = cur.lastrowid
+    except Exception as e:
+        db.log_error("comparison_report_generation", f"{type(e).__name__}: {e}", traceback_text=traceback.format_exc(), context={"sop_ids": sop_ids})
+
     conn.commit()
     conn.close()
-    db.log_audit(actor_label(), "run_comparison", "sop_category", None, {"sop_category": sop_category, "findings": len(result["findings"])})
+    db.log_audit(actor_label(), "run_comparison", "sop_ids", None, {"sop_ids": sop_ids, "findings": len(result["findings"])})
+    result["report_id"] = report_id
     return jsonify(result)
 
 
@@ -1091,6 +1156,51 @@ def download_revision_file(revision_id, kind):
         }), 404
     fname = f"{kind}_{rev['id']}.docx"
     return send_file(path, as_attachment=True, download_name=fname)
+
+
+# ---------------------------------------------------------------------------
+# Reports: downloadable Compliance Reports and Comparison Reports
+# ---------------------------------------------------------------------------
+@app.route("/api/reports", methods=["GET"])
+@require_auth()
+def list_reports():
+    site_id = request.args.get("site_id")
+    conn = db.get_db()
+    q = """
+        SELECT r.*, s.code as site_code, s.name as site_name, sop.sop_number
+        FROM reports r
+        LEFT JOIN sites s ON s.id = r.site_id
+        LEFT JOIN sops sop ON sop.id = r.sop_id
+    """
+    params = []
+    if site_id:
+        q += " WHERE r.site_id = ?"
+        params.append(site_id)
+    q += " ORDER BY r.id DESC"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return jsonify(db.rows_to_list(rows))
+
+
+@app.route("/api/reports/<int:report_id>/download", methods=["GET"])
+@require_auth()
+def download_report(report_id):
+    conn = db.get_db()
+    rep = conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+    conn.close()
+    if not rep:
+        return jsonify({"error": "not_found"}), 404
+    if not rep["filepath"] or not os.path.exists(rep["filepath"]):
+        return jsonify({
+            "error": "file_not_found",
+            "message": (
+                "This report file no longer exists on the server. Render's free tier wipes locally "
+                "stored files every time the app redeploys. Re-run the compliance check or comparison "
+                "to regenerate it."
+            ),
+        }), 404
+    safe_title = re.sub(r"[^A-Za-z0-9_.-]", "_", rep["title"])
+    return send_file(rep["filepath"], as_attachment=True, download_name=f"{safe_title}.docx")
 
 
 @app.route("/api/revisions/<int:revision_id>/decision", methods=["POST"])
