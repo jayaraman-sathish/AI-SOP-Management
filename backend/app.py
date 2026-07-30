@@ -702,6 +702,11 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor):
             WHERE sop.site_id = ?
         """, (site_id,)).fetchall()
         sops = db.rows_to_list(sop_rows)
+        # Whether this run considered every SOP currently uploaded at the site,
+        # vs. being scoped to a specific subset (the normal case now -- the
+        # per-SOP "Check Compliance" button always passes exactly one sop_id).
+        # This matters for what "SOP Missing" is allowed to mean below.
+        is_full_site_run = not requested_sop_ids
         if requested_sop_ids:
             requested_set = {int(i) for i in requested_sop_ids}
             sops = [s for s in sops if s["sop_id"] in requested_set]
@@ -743,6 +748,14 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor):
 
                 existing = conn.execute("SELECT id FROM rtm_entries WHERE requirement_id=? AND site_id=?", (req_d["id"], site_id)).fetchone()
                 sop_id = assessment.get("sop_id")
+                if sop_id is None and assessment["coverage_status"] != "SOP Missing" and len(sops) == 1:
+                    # Check Compliance is normally scoped to a single SOP (the per-SOP
+                    # "Check Compliance" button). If the model judged this requirement
+                    # relevant enough to not say "SOP Missing" but forgot to echo the
+                    # sop_id field back, there's no real ambiguity -- it can only be
+                    # this one SOP. Filling it in here means Generate Redline later
+                    # doesn't dead-end on a target that was obvious from context.
+                    sop_id = sops[0]["sop_id"]
                 if existing:
                     conn.execute(
                         "UPDATE rtm_entries SET coverage_status=?, rationale=?, cited_text=?, ai_proposed=?, ai_mock=?, updated_at=?, confirmed_by=NULL, confirmed_at=NULL WHERE requirement_id=? AND site_id=?",
@@ -757,13 +770,27 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor):
                     )
                     entry_id = cur.lastrowid
 
-                # Auto-create/refresh a gap record for anything not fully covered.
-                if assessment["coverage_status"] != "Covered":
-                    existing_gap = conn.execute("SELECT id FROM gaps WHERE rtm_entry_id=?", (entry_id,)).fetchone()
-                    # "SOP Missing" is a documentation-completeness gap (no relevant
-                    # SOP uploaded), not a confirmed regulatory failure -- cap it at
-                    # Major so it doesn't compete for attention with Critical gaps
-                    # found by actually reading an existing, in-scope SOP.
+                # Auto-create/refresh a gap record for anything not fully covered --
+                # except "SOP Missing" from a single-SOP-scoped run (the normal case
+                # via the per-SOP "Check Compliance" button). "SOP Missing" there
+                # means only that THIS document doesn't cover the topic -- exactly
+                # what the Compliance Report itself labels "Not Applicable to This
+                # SOP, not a finding". Treating it as an open, actionable gap
+                # contradicted that and flooded Gaps & Redlines with "Major" items
+                # for topics that are legitimately outside a given SOP's scope (e.g.
+                # a visual-inspection SOP correctly not addressing HVAC design).
+                # A genuine "no SOP anywhere at this site covers this topic"
+                # documentation gap only makes sense from a full-site run, which
+                # still creates/keeps the gap below.
+                existing_gap = conn.execute("SELECT id FROM gaps WHERE rtm_entry_id=?", (entry_id,)).fetchone()
+                if assessment["coverage_status"] == "SOP Missing" and not is_full_site_run:
+                    if existing_gap:
+                        conn.execute("UPDATE gaps SET status='Closed', updated_at=? WHERE id=?", (db.now(), existing_gap["id"]))
+                elif assessment["coverage_status"] != "Covered":
+                    # "SOP Missing" from a full-site run is a documentation-completeness
+                    # gap (no relevant SOP uploaded anywhere at this site) -- cap it at
+                    # Major so it doesn't compete for attention with Critical gaps found
+                    # by actually reading an existing, in-scope SOP.
                     risk = "Major" if assessment["coverage_status"] == "SOP Missing" else _default_risk(req_d)
                     desc = f"{assessment['coverage_status']} for {req_d['source']} {req_d['clause']} at {site['code']}: {assessment.get('rationale','')}"
                     if not existing_gap:
@@ -994,16 +1021,19 @@ def list_gaps():
     site_id = request.args.get("site_id")
     conn = db.get_db()
     q = """
-        SELECT g.*, s.code as site_code, s.name as site_name, req.req_code, req.source, req.clause, req.requirement_text, req.sop_category
+        SELECT g.*, s.code as site_code, s.name as site_name, req.req_code, req.source, req.clause, req.requirement_text, req.sop_category,
+               sop.id as gap_sop_id, sop.sop_number as gap_sop_number, sop.title as gap_sop_title
         FROM gaps g
         JOIN sites s ON s.id = g.site_id
         LEFT JOIN requirements req ON req.id = g.requirement_id
+        LEFT JOIN rtm_entries rtm ON rtm.id = g.rtm_entry_id
+        LEFT JOIN sops sop ON sop.id = rtm.sop_id
     """
     params = []
     if site_id:
         q += " WHERE g.site_id = ?"
         params.append(site_id)
-    q += " ORDER BY CASE g.risk_level WHEN 'Critical' THEN 0 WHEN 'Major' THEN 1 ELSE 2 END, g.id DESC"
+    q += " ORDER BY sop.sop_number IS NULL, sop.sop_number, CASE g.risk_level WHEN 'Critical' THEN 0 WHEN 'Major' THEN 1 ELSE 2 END, g.id DESC"
     rows = conn.execute(q, params).fetchall()
     conn.close()
     return jsonify(db.rows_to_list(rows))
@@ -1052,8 +1082,20 @@ def generate_redline(gap_id):
         candidate = conn.execute("SELECT id FROM sops WHERE site_id=? AND sop_category=? LIMIT 1", (gap["site_id"], requirement["sop_category"])).fetchone()
         sop_id = candidate["id"] if candidate else None
     if not sop_id:
+        # Last resort: if this site only has one SOP uploaded at all, there's no
+        # real ambiguity about which document a gap belongs to, even if the
+        # rtm_entries.sop_id wasn't recorded (e.g. an older run, or the model
+        # didn't echo it back) and the SOP's category text doesn't exactly match
+        # the requirement's category label.
+        site_sops = conn.execute("SELECT id FROM sops WHERE site_id=?", (gap["site_id"],)).fetchall()
+        if len(site_sops) == 1:
+            sop_id = site_sops[0]["id"]
+    if not sop_id:
         conn.close()
-        return jsonify({"error": "no_target_sop_identified", "hint": "pass sop_id explicitly in the request body"}), 400
+        return jsonify({
+            "error": "no_target_sop_identified",
+            "hint": "pass sop_id explicitly in the request body -- multiple SOPs exist for this site and none could be confidently matched to this gap",
+        }), 400
 
     sop = conn.execute("SELECT * FROM sops WHERE id=?", (sop_id,)).fetchone()
     version = conn.execute("SELECT * FROM sop_versions WHERE sop_id=? AND is_current=1", (sop_id,)).fetchone()

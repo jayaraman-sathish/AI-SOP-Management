@@ -694,7 +694,16 @@ async function reportsView() {
 // ---------------- Gaps ----------------
 async function gapsView() {
   const gaps = await api("/gaps?site_id=" + state.currentSiteId);
-  const rows = gaps.map(g => `
+  const groupKey = g => g.gap_sop_id ? `sop:${g.gap_sop_id}` : "none";
+  const groupLabel = g => g.gap_sop_number ? `${g.gap_sop_number}${g.gap_sop_title ? " — " + g.gap_sop_title : ""}` : "Not matched to a specific SOP";
+  const groups = {};
+  const order = [];
+  gaps.forEach(g => {
+    const key = groupKey(g);
+    if (!groups[key]) { groups[key] = { label: groupLabel(g), rows: [] }; order.push(key); }
+    groups[key].rows.push(g);
+  });
+  const rowHtml = g => `
     <tr>
       <td><span class="badge ${g.risk_level}">${g.risk_level}</span></td>
       <td>${g.req_code || ""}<br/><span class="muted">${g.source || ""} ${g.clause || ""}</span></td>
@@ -703,12 +712,17 @@ async function gapsView() {
       <td><input class="ownerInput" data-gap="${g.id}" value="${g.owner || ""}" placeholder="owner" style="width:90px;" /></td>
       <td><input class="dateInput" data-gap="${g.id}" type="date" value="${g.target_date || ""}" /></td>
       <td>${g.status !== "Closed" ? `<button class="btn small genRedlineBtn" data-gap="${g.id}">Generate Redline</button>` : "<span class='muted'>Closed</span>"}</td>
-    </tr>`).join("") || `<tr><td colspan="7" class="muted">No open gaps — run Check Compliance on a SOP in SOP Repository first.</td></tr>`;
+    </tr>`;
+  const groupsHtml = order.map(key => `
+    <h3 style="margin-top:18px;">${groups[key].label}</h3>
+    <table><thead><tr><th>Risk</th><th>Requirement</th><th>Description</th><th>Status</th><th>Owner</th><th>Target Date</th><th>Action</th></tr></thead>
+    <tbody>${groups[key].rows.map(rowHtml).join("")}</tbody></table>
+  `).join("") || `<p class="muted">No open gaps — run Check Compliance on a SOP in SOP Repository first.</p>`;
   return `
     <div class="card">
       <h2>Gaps & AI-Assisted Redlining — ${siteLabel()}</h2>
-      <p class="muted">Every non-"Covered" result from a Check Compliance run becomes a gap here. Generating a redline produces a Word file with native Track Changes enabled, plus a matching Change Summary — both land in the Review &amp; Approval tab.</p>
-      <table><thead><tr><th>Risk</th><th>Requirement</th><th>Description</th><th>Status</th><th>Owner</th><th>Target Date</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>
+      <p class="muted">Every non-"Covered" result from a Check Compliance run becomes a gap here, grouped by the SOP it applies to. Generating a redline produces a Word file with native Track Changes enabled, plus a matching Change Summary — both land in the Review &amp; Approval tab.</p>
+      ${groupsHtml}
     </div>
   `;
 }
@@ -1014,7 +1028,7 @@ function bindTabHandlers() {
         renderTab();
       } catch (e) {
         if (e.message === "no_target_sop_identified") {
-          toast("Can't redline this — no SOP has been uploaded for this gap's category yet. Upload the relevant SOP first, then re-run Check Compliance.");
+          toast("Can't redline this — multiple SOPs exist for this site and none could be confidently matched to this gap. Re-run Check Compliance for the specific SOP this gap belongs to, then try again.");
         } else {
           toast("Error: " + e.message);
         }
