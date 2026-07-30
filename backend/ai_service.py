@@ -55,14 +55,27 @@ def _call_claude(system_prompt, user_prompt, max_tokens=2000):
 
 
 def _extract_json(text):
-    """Pull the first JSON object/array out of a model response, tolerating markdown fences."""
+    """Pull the first JSON object/array out of a model response, tolerating markdown fences.
+
+    Every call site catches AIError and falls back to a safe default (offline
+    heuristic, or an honest "AI mock" placeholder) -- so any failure here must
+    surface as AIError, never a raw exception. A live model response is
+    sometimes truncated (hit max_tokens) or otherwise malformed JSON despite
+    being asked for strict JSON only; without this try/except, json.loads
+    raises json.JSONDecodeError directly, which no caller catches, so it was
+    escaping all the way to Flask's global error handler as an unhandled
+    "Something went wrong" error instead of degrading gracefully like every
+    other AI failure mode does."""
     text = text.strip()
     text = re.sub(r"^```(json)?", "", text).strip()
     text = re.sub(r"```$", "", text).strip()
     match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
     if not match:
         raise AIError("no_json_in_response")
-    return json.loads(match.group(1))
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError as e:
+        raise AIError(f"malformed_json_in_response ({e}) -- response may have been truncated")
 
 
 def _extract_json_object(text):
@@ -387,7 +400,13 @@ Respond with JSON exactly in this shape:
   ]
 }}"""
     try:
-        raw = _call_claude(system_prompt, user_prompt, max_tokens=1200)
+        # 1200 tokens was too tight for this response shape -- a handful of
+        # candidates, each with topic/source/clause/category/rationale, could
+        # exceed it and get cut off mid-JSON (hitting max_tokens truncates the
+        # response, not just wraps it, so the JSON is genuinely incomplete).
+        # That was surfacing as an unhandled JSONDecodeError in production
+        # rather than degrading gracefully. 3000 gives real headroom.
+        raw = _call_claude(system_prompt, user_prompt, max_tokens=3000)
         parsed = _extract_json_object(raw)
         candidates = parsed.get("candidates")
         if not isinstance(candidates, list):
