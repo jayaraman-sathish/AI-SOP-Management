@@ -50,6 +50,26 @@ def too_large(_e):
     }), 413
 
 
+@app.errorhandler(Exception)
+def handle_unexpected_error(e):
+    """Last-resort catch-all so an unforeseen bug (e.g. a live AI call
+    returning an unexpected shape somewhere not already guarded) surfaces as a
+    clean, readable JSON error in the UI instead of a raw stack trace or a
+    silently hung request. This does not replace fixing the root cause -- it
+    just guarantees the failure mode is legible when something new slips
+    through."""
+    # Let Flask's own handling take over for HTTP-level exceptions (404, 413, etc.)
+    # that already have a sensible default response -- only catch genuine bugs.
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return e
+    app.logger.exception("Unhandled error")
+    return jsonify({
+        "error": "internal_error",
+        "message": f"Something went wrong processing that request ({type(e).__name__}: {e}). This has been logged; try again, and if it keeps happening, it needs a code fix.",
+    }), 500
+
+
 @app.route("/", methods=["GET"])
 def serve_frontend():
     return send_from_directory(FRONTEND_DIR, "index.html")
@@ -548,54 +568,63 @@ def run_rtm_mapping():
         s["full_text"] = db.full_sop_text(conn, s["sop_id"])
 
     results = []
+    failed = []
     for req in requirements:
         req_d = db.row_to_dict(req)
-        candidates = [s for s in sops if (s["sop_category"] or "").strip().lower() == (req_d["sop_category"] or "").strip().lower()]
-        if not candidates:
-            candidates = sops  # fall back: let the model/heuristic look at everything if no category tag matches
-        excerpts = [{"sop_id": s["sop_id"], "sop_number": s["sop_number"], "title": s["title"], "text": s["full_text"]} for s in candidates]
+        try:
+            candidates = [s for s in sops if (s["sop_category"] or "").strip().lower() == (req_d["sop_category"] or "").strip().lower()]
+            if not candidates:
+                candidates = sops  # fall back: let the model/heuristic look at everything if no category tag matches
+            excerpts = [{"sop_id": s["sop_id"], "sop_number": s["sop_number"], "title": s["title"], "text": s["full_text"]} for s in candidates]
 
-        assessment = ai_service.assess_requirement_coverage(req_d, excerpts)
+            assessment = ai_service.assess_requirement_coverage(req_d, excerpts)
 
-        existing = conn.execute("SELECT id FROM rtm_entries WHERE requirement_id=? AND site_id=?", (req_d["id"], site_id)).fetchone()
-        sop_id = assessment.get("sop_id")
-        values = (
-            assessment["coverage_status"], assessment.get("rationale", ""), assessment.get("cited_text", ""),
-            1, int(bool(assessment.get("ai_mock"))), db.now(), req_d["id"], site_id, sop_id,
-        )
-        if existing:
-            conn.execute(
-                "UPDATE rtm_entries SET coverage_status=?, rationale=?, cited_text=?, ai_proposed=?, ai_mock=?, updated_at=?, confirmed_by=NULL, confirmed_at=NULL WHERE requirement_id=? AND site_id=?",
-                (assessment["coverage_status"], assessment.get("rationale", ""), assessment.get("cited_text", ""), 1, int(bool(assessment.get("ai_mock"))), db.now(), req_d["id"], site_id),
-            )
-            entry_id = existing["id"]
-            conn.execute("UPDATE rtm_entries SET sop_id=? WHERE id=?", (sop_id, entry_id))
-        else:
-            cur = conn.execute(
-                "INSERT INTO rtm_entries (requirement_id, site_id, sop_id, coverage_status, rationale, cited_text, ai_proposed, ai_mock, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (req_d["id"], site_id, sop_id, assessment["coverage_status"], assessment.get("rationale", ""), assessment.get("cited_text", ""), 1, int(bool(assessment.get("ai_mock"))), db.now()),
-            )
-            entry_id = cur.lastrowid
-
-        # Auto-create/refresh a gap record for anything not fully covered.
-        if assessment["coverage_status"] != "Covered":
-            existing_gap = conn.execute("SELECT id FROM gaps WHERE rtm_entry_id=?", (entry_id,)).fetchone()
-            risk = _default_risk(req_d)
-            desc = f"{assessment['coverage_status']} for {req_d['source']} {req_d['clause']} at {site['code']}: {assessment.get('rationale','')}"
-            if not existing_gap:
+            existing = conn.execute("SELECT id FROM rtm_entries WHERE requirement_id=? AND site_id=?", (req_d["id"], site_id)).fetchone()
+            sop_id = assessment.get("sop_id")
+            if existing:
                 conn.execute(
-                    "INSERT INTO gaps (rtm_entry_id, site_id, requirement_id, description, risk_level, status, created_at, updated_at) VALUES (?,?,?,?,?, 'Open', ?, ?)",
-                    (entry_id, site_id, req_d["id"], desc, risk, db.now(), db.now()),
+                    "UPDATE rtm_entries SET coverage_status=?, rationale=?, cited_text=?, ai_proposed=?, ai_mock=?, updated_at=?, confirmed_by=NULL, confirmed_at=NULL WHERE requirement_id=? AND site_id=?",
+                    (assessment["coverage_status"], assessment.get("rationale", ""), assessment.get("cited_text", ""), 1, int(bool(assessment.get("ai_mock"))), db.now(), req_d["id"], site_id),
                 )
+                entry_id = existing["id"]
+                conn.execute("UPDATE rtm_entries SET sop_id=? WHERE id=?", (sop_id, entry_id))
             else:
-                conn.execute("UPDATE gaps SET description=?, updated_at=? WHERE id=?", (desc, db.now(), existing_gap["id"]))
+                cur = conn.execute(
+                    "INSERT INTO rtm_entries (requirement_id, site_id, sop_id, coverage_status, rationale, cited_text, ai_proposed, ai_mock, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (req_d["id"], site_id, sop_id, assessment["coverage_status"], assessment.get("rationale", ""), assessment.get("cited_text", ""), 1, int(bool(assessment.get("ai_mock"))), db.now()),
+                )
+                entry_id = cur.lastrowid
 
-        results.append({"requirement_id": req_d["id"], "req_code": req_d["req_code"], **assessment})
+            # Auto-create/refresh a gap record for anything not fully covered.
+            if assessment["coverage_status"] != "Covered":
+                existing_gap = conn.execute("SELECT id FROM gaps WHERE rtm_entry_id=?", (entry_id,)).fetchone()
+                risk = _default_risk(req_d)
+                desc = f"{assessment['coverage_status']} for {req_d['source']} {req_d['clause']} at {site['code']}: {assessment.get('rationale','')}"
+                if not existing_gap:
+                    conn.execute(
+                        "INSERT INTO gaps (rtm_entry_id, site_id, requirement_id, description, risk_level, status, created_at, updated_at) VALUES (?,?,?,?,?, 'Open', ?, ?)",
+                        (entry_id, site_id, req_d["id"], desc, risk, db.now(), db.now()),
+                    )
+                else:
+                    conn.execute("UPDATE gaps SET description=?, updated_at=? WHERE id=?", (desc, db.now(), existing_gap["id"]))
 
-    conn.commit()
+            results.append({"requirement_id": req_d["id"], "req_code": req_d["req_code"], **assessment})
+            conn.commit()  # commit progress after each requirement so a later failure doesn't lose earlier work
+        except Exception as e:
+            # A single bad AI response or unexpected error must not take down the
+            # whole 41-requirement run -- record it, skip it, and keep going so
+            # the rest of the RTM still gets populated. This is the fix for RTM
+            # runs erroring out entirely partway through against real SOP data.
+            conn.rollback()
+            failed.append({"requirement_id": req_d["id"], "req_code": req_d["req_code"], "error": str(e)})
+
     conn.close()
-    db.log_audit(actor_label(), "run_rtm_mapping", "site", site_id, {"requirements_assessed": len(results)})
-    return jsonify({"site_id": site_id, "results": results})
+    db.log_audit(actor_label(), "run_rtm_mapping", "site", site_id, {"requirements_assessed": len(results), "failed": len(failed)})
+    response = {"site_id": site_id, "results": results}
+    if failed:
+        response["failed"] = failed
+        response["warning"] = f"{len(failed)} of {len(requirements)} requirement(s) could not be assessed and were skipped -- see 'failed' for details. The rest completed normally."
+    return jsonify(response)
 
 
 @app.route("/api/rtm/<int:entry_id>/confirm", methods=["PUT"])

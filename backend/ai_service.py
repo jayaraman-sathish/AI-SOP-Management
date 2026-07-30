@@ -65,6 +65,23 @@ def _extract_json(text):
     return json.loads(match.group(1))
 
 
+def _extract_json_object(text):
+    """Like _extract_json, but guarantees a dict back. A live model occasionally
+    wraps its answer in a JSON array (e.g. `[{...}]`) or returns some other
+    valid-but-wrong-shaped JSON despite the prompt asking for an object -- if we
+    don't guard against that here, code further down that does `parsed["key"]`
+    throws a raw TypeError that isn't an AIError and isn't caught, crashing the
+    entire batch (this happened in practice during live RTM runs). Treat any
+    non-dict result the same as a parse failure so it falls through to the
+    deterministic offline heuristic for just that one item instead."""
+    parsed = _extract_json(text)
+    if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
+        parsed = parsed[0]  # common model quirk: wrapping a single object in an array
+    if not isinstance(parsed, dict):
+        raise AIError(f"expected_json_object_got_{type(parsed).__name__}")
+    return parsed
+
+
 # ---------------------------------------------------------------------------
 # Task 1: Requirement -> SOP coverage assessment (RTM mapping)
 # ---------------------------------------------------------------------------
@@ -109,7 +126,9 @@ Assess whether the requirement is covered. Respond with JSON exactly in this sha
 }}"""
     try:
         raw = _call_claude(system_prompt, user_prompt, max_tokens=800)
-        parsed = _extract_json(raw)
+        parsed = _extract_json_object(raw)
+        if "coverage_status" not in parsed:
+            raise AIError("missing_coverage_status_in_response")
         parsed["ai_mock"] = False
         return parsed
     except AIError:
@@ -182,8 +201,11 @@ Respond with JSON exactly in this shape:
 }}"""
     try:
         raw = _call_claude(system_prompt, user_prompt, max_tokens=1500)
-        parsed = _extract_json(raw)
-        return {"findings": parsed.get("findings", []), "ai_mock": False}
+        parsed = _extract_json_object(raw)
+        findings = parsed.get("findings", [])
+        if not isinstance(findings, list):
+            raise AIError("findings_not_a_list")
+        return {"findings": findings, "ai_mock": False}
     except AIError:
         return {
             "findings": [
@@ -227,7 +249,9 @@ Draft the SOP procedural text that closes this gap. Respond with JSON exactly in
 }}"""
     try:
         raw = _call_claude(system_prompt, user_prompt, max_tokens=1200)
-        parsed = _extract_json(raw)
+        parsed = _extract_json_object(raw)
+        if "paragraphs" not in parsed:
+            raise AIError("missing_paragraphs_in_response")
         parsed["ai_mock"] = False
         return parsed
     except AIError:

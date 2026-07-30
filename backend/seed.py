@@ -50,9 +50,16 @@ REQUIREMENTS = [
 ("WHO GMP (TRS 1044, Annex 2)","§8","Quality Control","Finished product testing including sterility, pyrogen/endotoxin, and particulate matter testing.","QC Sterility & Endotoxin Testing"),
 ]
 
+# These run on every app startup (see render.yaml's startCommand), so this is
+# effectively the site/plant "master data" -- it's what makes your real plants
+# survive a Render redeploy even though Render's free tier wipes the database
+# on every restart (see README "Known limitations"). If you add or rename a
+# plant through the "Manage Sites" UI, update it here too, otherwise the next
+# redeploy will bring back whatever is listed below instead of your UI edits.
 DEMO_SITES = [
-    ("SITE-01", "Plant A (example)", "TBD", "Sterile Injectable", "Aseptic Fill-Finish", "US"),
-    ("SITE-02", "Plant B (example)", "TBD", "Sterile Injectable", "Terminal Sterilization", "EU"),
+    ("AJ", "Aspiro Jadcherla", "Jadcherla, India", "Sterile Injectable", "Aseptic Fill-Finish", "US, EU, India, Japan"),
+    ("AK", "Aspiro Karkapatla", "Karkapatla, India", "Sterile Injectable", "Aseptic Fill-Finish", "US, EU, India, Japan"),
+    ("AS", "Aspiro Specialities", "Hyderabad, India", "Sterile Injectable", "Aseptic Fill-Finish", "US, EU, India, Japan"),
 ]
 
 DEMO_USERS = [
@@ -77,7 +84,7 @@ def run():
     for code, name, location, product_type, sterilization, markets in DEMO_SITES:
         conn.execute(
             "INSERT OR IGNORE INTO sites (code, name, location, product_type, sterilization_method, markets, notes, created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (code, name, location, product_type, sterilization, markets, "Demo/example site — replace with real plant data.", db.now()),
+            (code, name, location, product_type, sterilization, markets, "", db.now()),
         )
     for username, name, password, role, site_id in DEMO_USERS:
         conn.execute(
@@ -86,7 +93,7 @@ def run():
         )
     conn.commit()
     conn.close()
-    print(f"Seeded {len(REQUIREMENTS)} requirements, {len(DEMO_SITES)} demo sites, {len(DEMO_USERS)} demo users.")
+    print(f"Seeded {len(REQUIREMENTS)} requirements, {len(DEMO_SITES)} sites, {len(DEMO_USERS)} demo users.")
     print("Demo logins (username / password):")
     for username, name, password, role, site_id in DEMO_USERS:
         print(f"  {username} / {password}   -> role={role}")
