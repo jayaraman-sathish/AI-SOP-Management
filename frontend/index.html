@@ -705,6 +705,7 @@ async function gapsView() {
   });
   const rowHtml = g => `
     <tr>
+      <td>${g.gap_sop_number || "<span class='muted'>—</span>"}</td>
       <td><span class="badge ${g.risk_level}">${g.risk_level}</span></td>
       <td>${g.req_code || ""}<br/><span class="muted">${g.source || ""} ${g.clause || ""}</span></td>
       <td style="max-width:260px;">${g.description}</td>
@@ -715,7 +716,7 @@ async function gapsView() {
     </tr>`;
   const groupsHtml = order.map(key => `
     <h3 style="margin-top:18px;">${groups[key].label}</h3>
-    <table><thead><tr><th>Risk</th><th>Requirement</th><th>Description</th><th>Status</th><th>Owner</th><th>Target Date</th><th>Action</th></tr></thead>
+    <table><thead><tr><th>SOP</th><th>Risk</th><th>Requirement</th><th>Description</th><th>Status</th><th>Owner</th><th>Target Date</th><th>Action</th></tr></thead>
     <tbody>${groups[key].rows.map(rowHtml).join("")}</tbody></table>
   `).join("") || `<p class="muted">No open gaps — run Check Compliance on a SOP in SOP Repository first.</p>`;
   return `
@@ -773,7 +774,9 @@ async function revisionsView() {
       <td>${r.site_code}</td>
       <td>${r.sop_number}<br/><span class="muted">${r.sop_title}</span></td>
       <td>${r.new_version_label}</td>
-      <td><span class="badge ${r.status === 'Approved' ? 'Covered' : r.status === 'Rejected' ? 'NotCovered' : 'Partially'}">${r.status}</span> ${r.ai_mock ? `<span class="badge mock">AI mock</span>` : ""}</td>
+      <td>${(r.created_at || "").slice(0,16).replace("T", " ")}</td>
+      <td><span class="badge ${r.status === 'Approved' ? 'Covered' : r.status === 'Rejected' ? 'NotCovered' : 'Partially'}">${r.status}</span> ${r.ai_mock ? `<span class="badge mock">AI mock</span>` : ""}
+        ${r.decided_at ? `<div class="muted" style="font-size:11px;">decided ${r.decided_at.slice(0,16).replace("T"," ")}</div>` : ""}</td>
       <td>
         <button class="btn small secondary dlBtn" data-rev="${r.id}" data-kind="redline">Download Redline</button>
         <button class="btn small secondary dlBtn" data-rev="${r.id}" data-kind="summary">Download Summary</button>
@@ -783,12 +786,12 @@ async function revisionsView() {
         <button class="btn small approveBtn" data-rev="${r.id}">Approve</button>
         <button class="btn small secondary rejectBtn" data-rev="${r.id}">Reject</button>
       ` : (r.decided_by ? `<span class="muted">by ${r.decided_by}</span>` : "")}</td>
-    </tr>`).join("") || `<tr><td colspan="6" class="muted">No SOP revisions generated yet.</td></tr>`;
+    </tr>`).join("") || `<tr><td colspan="7" class="muted">No SOP revisions generated yet.</td></tr>`;
   return `
     <div class="card">
       <h2>Review &amp; Approval</h2>
       <p class="muted">Every generated redline appears here for review. Download the redline to review Track Changes directly in Word; the Change Summary shows every edit tied to its regulatory clause. ${canDecide ? "" : "Your role (" + state.user.role + ") can view and download but not sign off — sign in as qa1, quality_lead, or admin to approve/reject."}</p>
-      <table><thead><tr><th>Site</th><th>SOP</th><th>New Version</th><th>Status</th><th>Files</th><th>Decision (e-signature)</th></tr></thead><tbody>${rows}</tbody></table>
+      <table><thead><tr><th>Site</th><th>SOP</th><th>New Version</th><th>Generated</th><th>Status</th><th>Files</th><th>Decision (e-signature)</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
   `;
 }
