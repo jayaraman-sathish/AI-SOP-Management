@@ -108,9 +108,20 @@ def generate_tracked_redline(source_docx_path, output_docx_path, heading, paragr
 
     # Insert right before the sectPr at the end of the body (standard docx structure),
     # so the new tracked content lands at the end of the document body.
-    sect_pr_match = re.search(r"<w:sectPr[ >]", xml)
-    if sect_pr_match:
-        idx = sect_pr_match.start()
+    #
+    # IMPORTANT: a document can contain more than one <w:sectPr> -- every section
+    # break before the last one is nested inside the <w:pPr> of that section's
+    # final paragraph (e.g. a landscape page for a wide table, common in real
+    # SOPs with annexures). Only the very LAST <w:sectPr> in the file is the
+    # true end-of-body one, appearing as a direct child of <w:body> after the
+    # final paragraph. Using the FIRST match (as this used to) planted our new
+    # <w:p> blocks inside an earlier section-break's <w:pPr> -- <w:p> is not a
+    # valid child of <w:pPr>, so Word rejected the whole file as corrupt. Using
+    # the LAST match is always correct: there is exactly one final sectPr and it
+    # is always positioned after everything else in the body.
+    sect_pr_matches = list(re.finditer(r"<w:sectPr[ >]", xml))
+    if sect_pr_matches:
+        idx = sect_pr_matches[-1].start()
         new_xml = xml[:idx] + insertion_xml + xml[idx:]
     else:
         # Fallback: insert before </w:body>
@@ -118,18 +129,15 @@ def generate_tracked_redline(source_docx_path, output_docx_path, heading, paragr
 
     contents["word/document.xml"] = new_xml.encode("utf-8")
 
-    # Ensure settings.xml has rsid/track-changes friendly settings; enable trackChanges flag if settings.xml exists.
-    if "word/settings.xml" in contents:
-        settings_xml = contents["word/settings.xml"].decode("utf-8")
-        if "<w:trackChanges" not in settings_xml:
-            settings_xml = settings_xml.replace(
-                "<w:settings", "<w:settings", 1
-            )
-            # insert trackChanges element right after opening <w:settings ...> tag
-            m = re.search(r"(<w:settings[^>]*>)", settings_xml)
-            if m:
-                settings_xml = settings_xml[: m.end()] + "<w:trackChanges/>" + settings_xml[m.end():]
-            contents["word/settings.xml"] = settings_xml.encode("utf-8")
+    # Deliberately NOT injecting <w:trackChanges/> into settings.xml: it was being
+    # inserted as the first child of <w:settings>, which violates the schema's
+    # required element order (CT_Settings expects a long, specific sequence --
+    # trackChanges has to slot in at a precise position, not just "first"), and
+    # a validator run against a real multi-section SOP flagged it as invalid.
+    # It's also unnecessary: Word displays existing <w:ins>/<w:del> markup as
+    # tracked changes regardless of this setting -- it only affects whether
+    # Word tracks *new* edits the reviewer makes afterward, which isn't needed
+    # for the redline to render correctly.
 
     with zipfile.ZipFile(output_docx_path, "w", zipfile.ZIP_DEFLATED) as zout:
         for name, data in contents.items():

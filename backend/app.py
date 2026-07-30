@@ -591,10 +591,31 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor):
             try:
                 candidates = [s for s in sops if (s["sop_category"] or "").strip().lower() == (req_d["sop_category"] or "").strip().lower()]
                 if not candidates:
-                    candidates = sops  # fall back: let the model/heuristic look at everything if no category tag matches
-                excerpts = [{"sop_id": s["sop_id"], "sop_number": s["sop_number"], "title": s["title"], "text": s["full_text"]} for s in candidates]
-
-                assessment = ai_service.assess_requirement_coverage(req_d, excerpts)
+                    # No SOP tagged with this requirement's category has been uploaded
+                    # for this site at all. Previously this fell back to checking the
+                    # requirement against whatever SOPs *were* uploaded (e.g. a Visual
+                    # Inspection SOP checked against a Facility Design requirement),
+                    # which reliably produced a confident "Not Covered" that read like
+                    # a genuine compliance failure -- when the real situation is just
+                    # "this system was never given a relevant document to check". Skip
+                    # the AI call and record the honest, distinct status instead: the
+                    # gap is in what's been uploaded here, not a confirmed finding
+                    # against an existing procedure.
+                    assessment = {
+                        "coverage_status": "SOP Missing",
+                        "rationale": (
+                            f"No SOP tagged '{req_d['sop_category']}' has been uploaded for this site. "
+                            "This means this system has no document to check this requirement against -- "
+                            "it is not a confirmed finding that the plant lacks this control. If a relevant "
+                            "SOP exists, upload it and tag it with this category to get a real assessment."
+                        ),
+                        "cited_text": "",
+                        "sop_id": None,
+                        "ai_mock": False,
+                    }
+                else:
+                    excerpts = [{"sop_id": s["sop_id"], "sop_number": s["sop_number"], "title": s["title"], "text": s["full_text"]} for s in candidates]
+                    assessment = ai_service.assess_requirement_coverage(req_d, excerpts)
 
                 existing = conn.execute("SELECT id FROM rtm_entries WHERE requirement_id=? AND site_id=?", (req_d["id"], site_id)).fetchone()
                 sop_id = assessment.get("sop_id")
@@ -615,7 +636,11 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor):
                 # Auto-create/refresh a gap record for anything not fully covered.
                 if assessment["coverage_status"] != "Covered":
                     existing_gap = conn.execute("SELECT id FROM gaps WHERE rtm_entry_id=?", (entry_id,)).fetchone()
-                    risk = _default_risk(req_d)
+                    # "SOP Missing" is a documentation-completeness gap (no relevant
+                    # SOP uploaded), not a confirmed regulatory failure -- cap it at
+                    # Major so it doesn't compete for attention with Critical gaps
+                    # found by actually reading an existing, in-scope SOP.
+                    risk = "Major" if assessment["coverage_status"] == "SOP Missing" else _default_risk(req_d)
                     desc = f"{assessment['coverage_status']} for {req_d['source']} {req_d['clause']} at {site['code']}: {assessment.get('rationale','')}"
                     if not existing_gap:
                         conn.execute(
@@ -847,6 +872,16 @@ def generate_redline(gap_id):
     if not version:
         conn.close()
         return jsonify({"error": "sop_has_no_current_version"}), 400
+    if not version["filepath"] or not os.path.exists(version["filepath"]):
+        conn.close()
+        return jsonify({
+            "error": "original_sop_file_missing",
+            "message": (
+                "The original uploaded file for this SOP no longer exists on the server "
+                "(Render's free tier wipes locally stored files on every redeploy). A redline "
+                "can't be generated without the original document -- re-upload this SOP, then try again."
+            ),
+        }), 400
 
     requirement_d = db.row_to_dict(requirement)
     # Give the drafting model the whole SOP package (main doc + annexures/formats),
@@ -922,7 +957,15 @@ def download_revision_file(revision_id, kind):
         return jsonify({"error": "not_found"}), 404
     path = rev["draft_filepath"] if kind == "redline" else rev["summary_filepath"] if kind == "summary" else None
     if not path or not os.path.exists(path):
-        return jsonify({"error": "file_not_found"}), 404
+        return jsonify({
+            "error": "file_not_found",
+            "message": (
+                "This file no longer exists on the server. Render's free tier wipes locally "
+                "stored files (uploads and generated documents) every time the app redeploys, "
+                "which just happened. Re-run Generate Redline for this gap to recreate it -- if "
+                "that also fails, the original SOP file was wiped too and needs to be re-uploaded first."
+            ),
+        }), 404
     fname = f"{kind}_{rev['id']}.docx"
     return send_file(path, as_attachment=True, download_name=fname)
 
