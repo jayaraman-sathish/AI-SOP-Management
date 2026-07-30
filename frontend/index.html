@@ -589,11 +589,11 @@ async function doUploadSop() {
 
   const totalBytes = pendingFiles.reduce((sum, pf) => sum + pf.file.size, 0);
   const estimatedUploadMB = Math.round((totalBytes * 1.34) / 1024 / 1024); // base64 overhead
-  if (estimatedUploadMB > 40) {
-    toast(`This batch is ~${estimatedUploadMB}MB once encoded — over the 45MB server limit. Remove a large file (check sizes in the list above) or upload it separately.`);
+  if (estimatedUploadMB > 90) {
+    toast(`This batch is ~${estimatedUploadMB}MB once encoded — over the 100MB server limit. Remove a large file (check sizes in the list above) or upload it separately.`);
     return;
   }
-  if (estimatedUploadMB > 15) {
+  if (estimatedUploadMB > 20) {
     toast(`Uploading ~${estimatedUploadMB}MB — this may take a minute or two on the free-tier server, please wait.`);
   }
 
