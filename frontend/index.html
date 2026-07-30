@@ -165,6 +165,7 @@ const TABS = [
   { id: "rtm", label: "RTM" },
   { id: "comparison", label: "Site Comparison" },
   { id: "gaps", label: "Gaps & Redlines" },
+  { id: "discovery", label: "Suggested Requirements" },
   { id: "revisions", label: "Review & Approval" },
   { id: "audit", label: "Audit Trail" },
 ];
@@ -333,6 +334,7 @@ async function renderTab() {
     else if (state.tab === "rtm") main.innerHTML = await rtmView();
     else if (state.tab === "comparison") main.innerHTML = await comparisonView();
     else if (state.tab === "gaps") main.innerHTML = await gapsView();
+    else if (state.tab === "discovery") main.innerHTML = await discoveryView();
     else if (state.tab === "revisions") main.innerHTML = await revisionsView();
     else if (state.tab === "audit") main.innerHTML = await auditView();
     bindTabHandlers();
@@ -387,6 +389,7 @@ async function sopsView() {
       <td>
         <button class="btn small secondary viewFilesBtn" data-sop="${s.id}" data-number="${s.sop_number}">View / Download Files</button>
         <button class="btn small secondary editSopBtn" data-sop="${s.id}" data-title="${(s.title||"").replace(/"/g,'&quot;')}" data-process="${(s.process_area||"").replace(/"/g,'&quot;')}" data-category="${(s.sop_category||"").replace(/"/g,'&quot;')}">Edit</button>
+        <button class="btn small secondary discoverGapsBtn" data-sop="${s.id}" data-number="${s.sop_number}">Discover Additional Requirements</button>
       </td>
     </tr>`).join("") || `<tr><td colspan="7" class="muted">No SOPs uploaded for this site yet.</td></tr>`;
   return `
@@ -397,6 +400,7 @@ async function sopsView() {
         <span class="muted">Drop in the main SOP plus any annexures/formats together — AI gap analysis reads all of them.</span>
       </div>
       <p class="muted">No SOP Category set? Site Comparison and AI matching both need it — click <b>Edit</b> on a row to set or fix it without re-uploading.</p>
+      <p class="muted"><b>Discover Additional Requirements</b> reads this SOP and suggests regulatory topics (USP, PDA, EU/WHO/FDA clauses) that aren't in the requirement library yet but this SOP's subject matter would typically need to address. These are unverified AI suggestions, not confirmed findings — review them in the Suggested Requirements tab before they count toward RTM.</p>
       <table><thead><tr><th>SOP Number</th><th>Title</th><th>Category</th><th>Version</th><th>Attachments</th><th>Uploaded</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
     ${uploadModal()}
@@ -711,6 +715,43 @@ async function gapsView() {
   `;
 }
 
+// ---------------- Suggested Requirements (Discovery) ----------------
+async function discoveryView() {
+  const canReview = ["admin", "quality_lead"].includes(state.user.role);
+  const cands = await api("/discovery-candidates?site_id=" + state.currentSiteId);
+  const rows = cands.map(c => `
+    <tr data-cand="${c.id}">
+      <td>${c.sop_number}<br/><span class="muted">${c.sop_title || ""}</span></td>
+      <td>${c.topic}</td>
+      <td>${[c.suggested_source, c.suggested_clause].filter(Boolean).join(" ")}<br/><span class="muted">${c.suggested_category || ""}</span></td>
+      <td style="max-width:260px;">${c.rationale || ""}</td>
+      <td><span class="badge ${c.status === 'Promoted' ? 'Covered' : c.status === 'Dismissed' ? 'NotAssessed' : 'mock'}">${c.status}</span></td>
+      <td>${c.status === "New" && canReview ? `
+        <button class="btn small promoteCandBtn" data-cand="${c.id}">Promote to Library</button>
+        <button class="btn small secondary dismissCandBtn" data-cand="${c.id}">Dismiss</button>
+      ` : c.status === "Promoted" ? `<span class="muted">now ${c.req_code || "in library"}</span>` : c.status === "New" ? `<span class="muted">needs admin/quality_lead review</span>` : `<span class="muted">by ${c.reviewed_by || ""}</span>`}</td>
+    </tr>
+    <tr class="promoteFormRow hidden" data-cand-form="${c.id}">
+      <td colspan="6">
+        <div class="row" style="flex-wrap:wrap; gap:8px;">
+          <div class="field"><label>Source</label><input class="promote_source" value="${(c.suggested_source||"").replace(/"/g,'&quot;')}" style="width:160px;" /></div>
+          <div class="field"><label>Clause</label><input class="promote_clause" value="${(c.suggested_clause||"").replace(/"/g,'&quot;')}" style="width:120px;" /></div>
+          <div class="field"><label>SOP Category</label><input class="promote_category" value="${(c.suggested_category||"").replace(/"/g,'&quot;')}" style="width:220px;" /></div>
+          <div class="field" style="flex:1;"><label>Requirement Text</label><input class="promote_text" value="${(c.rationale||c.topic||"").replace(/"/g,'&quot;')}" style="width:100%;" /></div>
+          <button class="btn small confirmPromoteBtn" data-cand="${c.id}">Confirm Add to Library</button>
+          <button class="btn small secondary cancelPromoteBtn" data-cand="${c.id}">Cancel</button>
+        </div>
+      </td>
+    </tr>`).join("") || `<tr><td colspan="6" class="muted">No suggestions yet — click "Discover Additional Requirements" on an SOP in SOP Repository to check.</td></tr>`;
+  return `
+    <div class="card">
+      <h2>Suggested Requirements — ${siteLabel()}</h2>
+      <p class="muted">These are AI-suggested regulatory topics found while reading an SOP's actual content that aren't yet in the curated requirement library RTM checks against. They are <b>not</b> official findings — nothing here affects RTM, Gaps, or coverage stats until ${canReview ? "you" : "an admin or quality lead"} reviews and promotes it into the real library below.</p>
+      <table><thead><tr><th>SOP</th><th>Topic</th><th>Suggested Source / Clause</th><th>Rationale</th><th>Status</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>
+  `;
+}
+
 // ---------------- Revisions (Review & Approval) ----------------
 async function revisionsView() {
   const revs = await api("/revisions");
@@ -868,6 +909,64 @@ function bindTabHandlers() {
       renderTab();
     } catch (e) { toast("Error: " + e.message); }
   };
+
+  document.querySelectorAll(".discoverGapsBtn").forEach(btn => {
+    btn.onclick = async () => {
+      btn.disabled = true; btn.textContent = "Discovering…";
+      try {
+        const res = await api(`/sops/${btn.dataset.sop}/discover-gaps`, { method: "POST", body: JSON.stringify({}) });
+        if (res.ai_mock) {
+          toast(res.offline_note || "Discovery needs a live Claude API key — no offline fallback exists for this feature.");
+        } else if (res.candidates_found === 0) {
+          toast(`No additional requirements suggested for ${btn.dataset.number} — the current library looks complete for this SOP's content.`);
+        } else {
+          toast(`${res.candidates_found} suggested requirement(s) found for ${btn.dataset.number} — see the Suggested Requirements tab.`);
+        }
+      } catch (e) { toast("Error: " + e.message); }
+      btn.disabled = false; btn.textContent = "Discover Additional Requirements";
+    };
+  });
+
+  document.querySelectorAll(".dismissCandBtn").forEach(btn => {
+    btn.onclick = async () => {
+      try {
+        await api(`/discovery-candidates/${btn.dataset.cand}/dismiss`, { method: "POST", body: JSON.stringify({}) });
+        toast("Dismissed.");
+        renderTab();
+      } catch (e) { toast("Error: " + e.message); }
+    };
+  });
+  document.querySelectorAll(".promoteCandBtn").forEach(btn => {
+    btn.onclick = () => {
+      document.querySelector(`.promoteFormRow[data-cand-form="${btn.dataset.cand}"]`).classList.remove("hidden");
+    };
+  });
+  document.querySelectorAll(".cancelPromoteBtn").forEach(btn => {
+    btn.onclick = () => {
+      document.querySelector(`.promoteFormRow[data-cand-form="${btn.dataset.cand}"]`).classList.add("hidden");
+    };
+  });
+  document.querySelectorAll(".confirmPromoteBtn").forEach(btn => {
+    btn.onclick = async () => {
+      const formRow = document.querySelector(`.promoteFormRow[data-cand-form="${btn.dataset.cand}"]`);
+      const category = formRow.querySelector(".promote_category").value.trim();
+      if (!category) { toast("SOP Category is required to promote this into the library."); return; }
+      btn.disabled = true; btn.textContent = "Adding…";
+      try {
+        const res = await api(`/discovery-candidates/${btn.dataset.cand}/promote`, {
+          method: "POST",
+          body: JSON.stringify({
+            source: formRow.querySelector(".promote_source").value.trim(),
+            clause: formRow.querySelector(".promote_clause").value.trim(),
+            sop_category: category,
+            requirement_text: formRow.querySelector(".promote_text").value.trim(),
+          }),
+        });
+        toast(`Added to the library as ${res.req_code}. Future RTM runs will check against it.`);
+        renderTab();
+      } catch (e) { toast("Error: " + e.message); btn.disabled = false; btn.textContent = "Confirm Add to Library"; }
+    };
+  });
 
   const rtmSelectAll = document.getElementById("rtmSelectAll");
   if (rtmSelectAll) rtmSelectAll.onclick = () => document.querySelectorAll(".rtmSopCheck").forEach(c => c.checked = true);

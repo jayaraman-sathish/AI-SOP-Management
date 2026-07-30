@@ -525,6 +525,133 @@ def add_sop_attachments(version_id):
 
 
 # ---------------------------------------------------------------------------
+# Discovery: AI-suggested requirements not in the curated library (unverified
+# candidates for human review -- never an official RTM finding on their own)
+# ---------------------------------------------------------------------------
+@app.route("/api/sops/<int:sop_id>/discover-gaps", methods=["POST"])
+@require_auth(roles=["admin", "analyst", "quality_lead"])
+def discover_gaps(sop_id):
+    conn = db.get_db()
+    sop = conn.execute("SELECT * FROM sops WHERE id=?", (sop_id,)).fetchone()
+    if not sop:
+        conn.close()
+        return jsonify({"error": "sop_not_found"}), 404
+    full_text = db.full_sop_text(conn, sop_id)
+    if not full_text:
+        conn.close()
+        return jsonify({"error": "sop_has_no_extracted_text"}), 400
+    existing = conn.execute(
+        "SELECT source, clause, requirement_text FROM requirements WHERE sop_category=?", (sop["sop_category"],)
+    ).fetchall()
+    existing_summaries = [f"{r['source']} {r['clause']}: {r['requirement_text'][:100]}" for r in existing]
+
+    result = ai_service.discover_uncovered_topics(sop["title"], sop["sop_category"], full_text, existing_summaries)
+
+    saved_ids = []
+    for c in result["candidates"]:
+        cur = conn.execute(
+            "INSERT INTO discovery_candidates (sop_id, site_id, topic, suggested_source, suggested_clause, "
+            "suggested_category, rationale, status, created_at) VALUES (?,?,?,?,?,?,?, 'New', ?)",
+            (
+                sop_id, sop["site_id"], c.get("topic", ""), c.get("suggested_source", ""),
+                c.get("suggested_clause", ""), c.get("suggested_category", ""), c.get("rationale", ""), db.now(),
+            ),
+        )
+        saved_ids.append(cur.lastrowid)
+    conn.commit()
+    conn.close()
+    db.log_audit(actor_label(), "discover_gaps", "sop", sop_id, {"candidates_found": len(saved_ids), "ai_mock": result["ai_mock"]})
+    return jsonify({
+        "candidates_found": len(saved_ids),
+        "ai_mock": result["ai_mock"],
+        "offline_note": result.get("offline_note"),
+    })
+
+
+@app.route("/api/discovery-candidates", methods=["GET"])
+@require_auth()
+def list_discovery_candidates():
+    site_id = request.args.get("site_id")
+    conn = db.get_db()
+    q = """
+        SELECT dc.*, sop.sop_number, sop.title as sop_title, s.code as site_code
+        FROM discovery_candidates dc
+        JOIN sops sop ON sop.id = dc.sop_id
+        JOIN sites s ON s.id = dc.site_id
+    """
+    params = []
+    if site_id:
+        q += " WHERE dc.site_id = ?"
+        params.append(site_id)
+    q += " ORDER BY dc.id DESC"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return jsonify(db.rows_to_list(rows))
+
+
+@app.route("/api/discovery-candidates/<int:cand_id>/dismiss", methods=["POST"])
+@require_auth(roles=["admin", "quality_lead"])
+def dismiss_discovery_candidate(cand_id):
+    conn = db.get_db()
+    cand = conn.execute("SELECT id FROM discovery_candidates WHERE id=?", (cand_id,)).fetchone()
+    if not cand:
+        conn.close()
+        return jsonify({"error": "not_found"}), 404
+    conn.execute(
+        "UPDATE discovery_candidates SET status='Dismissed', reviewed_by=?, reviewed_at=? WHERE id=?",
+        (actor_label(), db.now(), cand_id),
+    )
+    conn.commit()
+    conn.close()
+    db.log_audit(actor_label(), "dismiss_discovery_candidate", "discovery_candidate", cand_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/discovery-candidates/<int:cand_id>/promote", methods=["POST"])
+@require_auth(roles=["admin", "quality_lead"])
+def promote_discovery_candidate(cand_id):
+    """Turns a reviewed candidate into a real, official requirement in the
+    curated library -- the only way one of these ever becomes something RTM
+    actually checks against. The reviewer can override any field; whatever
+    they submit (or the original AI suggestion, if left blank) is what gets
+    stored, so this is the human-vetting step, not an automatic promotion."""
+    data = request.get_json(force=True)
+    conn = db.get_db()
+    cand = conn.execute("SELECT * FROM discovery_candidates WHERE id=?", (cand_id,)).fetchone()
+    if not cand:
+        conn.close()
+        return jsonify({"error": "not_found"}), 404
+    if cand["status"] == "Promoted":
+        conn.close()
+        return jsonify({"error": "already_promoted", "requirement_id": cand["promoted_requirement_id"]}), 400
+
+    req_code = f"REQ-{secrets.token_hex(3).upper()}"
+    source = (data.get("source") or cand["suggested_source"] or "Custom").strip()
+    clause = (data.get("clause") or cand["suggested_clause"] or "").strip()
+    category = (data.get("sop_category") or cand["suggested_category"] or "").strip()
+    process_area = (data.get("process_area") or cand["topic"] or "").strip()
+    requirement_text = (data.get("requirement_text") or cand["rationale"] or cand["topic"] or "").strip()
+    if not category:
+        conn.close()
+        return jsonify({"error": "sop_category_required"}), 400
+
+    cur = conn.execute(
+        "INSERT INTO requirements (req_code, source, clause, process_area, requirement_text, sop_category, created_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (req_code, source, clause, process_area, requirement_text, category, db.now()),
+    )
+    new_req_id = cur.lastrowid
+    conn.execute(
+        "UPDATE discovery_candidates SET status='Promoted', reviewed_by=?, reviewed_at=?, promoted_requirement_id=? WHERE id=?",
+        (actor_label(), db.now(), new_req_id, cand_id),
+    )
+    conn.commit()
+    conn.close()
+    db.log_audit(actor_label(), "promote_discovery_candidate", "discovery_candidate", cand_id, {"new_requirement_id": new_req_id, "req_code": req_code})
+    return jsonify({"ok": True, "requirement_id": new_req_id, "req_code": req_code})
+
+
+# ---------------------------------------------------------------------------
 # RTM: AI-assisted requirement-to-SOP mapping
 # ---------------------------------------------------------------------------
 @app.route("/api/rtm", methods=["GET"])
@@ -589,32 +716,28 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor):
         for req in requirements:
             req_d = db.row_to_dict(req)
             try:
-                candidates = [s for s in sops if (s["sop_category"] or "").strip().lower() == (req_d["sop_category"] or "").strip().lower()]
-                if not candidates:
-                    # No SOP tagged with this requirement's category has been uploaded
-                    # for this site at all. Previously this fell back to checking the
-                    # requirement against whatever SOPs *were* uploaded (e.g. a Visual
-                    # Inspection SOP checked against a Facility Design requirement),
-                    # which reliably produced a confident "Not Covered" that read like
-                    # a genuine compliance failure -- when the real situation is just
-                    # "this system was never given a relevant document to check". Skip
-                    # the AI call and record the honest, distinct status instead: the
-                    # gap is in what's been uploaded here, not a confirmed finding
-                    # against an existing procedure.
+                if not sops:
+                    # Nothing at all has been uploaded/checked for this site --
+                    # a cheap, honest shortcut that doesn't need an AI call.
                     assessment = {
                         "coverage_status": "SOP Missing",
-                        "rationale": (
-                            f"No SOP tagged '{req_d['sop_category']}' has been uploaded for this site. "
-                            "This means this system has no document to check this requirement against -- "
-                            "it is not a confirmed finding that the plant lacks this control. If a relevant "
-                            "SOP exists, upload it and tag it with this category to get a real assessment."
-                        ),
+                        "rationale": "No SOP has been uploaded (or checked) for this site at all.",
                         "cited_text": "",
                         "sop_id": None,
-                        "ai_mock": False,
+                        "ai_mock": True,
                     }
                 else:
-                    excerpts = [{"sop_id": s["sop_id"], "sop_number": s["sop_number"], "title": s["title"], "text": s["full_text"]} for s in candidates]
+                    # Matching is content-driven, not category-tag-driven: every
+                    # currently-checked SOP is passed as a candidate for every
+                    # requirement, and the model itself judges relevance from
+                    # actual text rather than trusting a category label upstream.
+                    # This means a mistagged or partially-relevant SOP can still
+                    # get matched correctly, and it means a requirement whose
+                    # topic none of the checked SOPs actually address gets an
+                    # honest "SOP Missing" (decided by the model reading the
+                    # content) instead of either a false "Not Covered" against an
+                    # unrelated document or a missed match from a wrong tag.
+                    excerpts = [{"sop_id": s["sop_id"], "sop_number": s["sop_number"], "title": s["title"], "text": s["full_text"]} for s in sops]
                     assessment = ai_service.assess_requirement_coverage(req_d, excerpts)
 
                 existing = conn.execute("SELECT id FROM rtm_entries WHERE requirement_id=? AND site_id=?", (req_d["id"], site_id)).fetchone()

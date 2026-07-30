@@ -173,6 +173,27 @@ CREATE TABLE IF NOT EXISTS error_log (
     context_json TEXT,
     timestamp TEXT NOT NULL
 );
+
+-- AI-suggested requirements found while reading an SOP that aren't in the
+-- curated requirements library above. Deliberately kept separate from
+-- `requirements`/`rtm_entries`: these are unverified candidates an AI noticed,
+-- not vetted regulatory clauses, and must never be treated as an official RTM
+-- finding until a human reviews and promotes one into the real library.
+CREATE TABLE IF NOT EXISTS discovery_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sop_id INTEGER NOT NULL REFERENCES sops(id),
+    site_id INTEGER NOT NULL REFERENCES sites(id),
+    topic TEXT NOT NULL,
+    suggested_source TEXT,
+    suggested_clause TEXT,
+    suggested_category TEXT,
+    rationale TEXT,
+    status TEXT NOT NULL DEFAULT 'New',
+    created_at TEXT NOT NULL,
+    reviewed_by TEXT,
+    reviewed_at TEXT,
+    promoted_requirement_id INTEGER
+);
 """
 
 

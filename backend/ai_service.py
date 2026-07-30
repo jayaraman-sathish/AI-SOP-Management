@@ -88,13 +88,18 @@ def _extract_json_object(text):
 def assess_requirement_coverage(requirement, sop_excerpts):
     """
     requirement: dict with source, clause, process_area, requirement_text, sop_category
-    sop_excerpts: list of {sop_id, sop_number, title, text}
+    sop_excerpts: list of {sop_id, sop_number, title, text} -- every SOP currently
+        checked for this site, NOT pre-filtered by category. Relevance is judged
+        from actual content here, not from a category tag matching upstream --
+        a mistagged or partially-relevant SOP can still get matched correctly,
+        and a requirement with no genuinely relevant SOP gets an honest
+        "SOP Missing" instead of a false "Not Covered" against an unrelated doc.
     returns: dict {coverage_status, rationale, cited_text, sop_id, ai_mock}
     """
     if not sop_excerpts:
         return {
             "coverage_status": "SOP Missing",
-            "rationale": "No SOP at this site is tagged to the process area/category this requirement falls under.",
+            "rationale": "No SOP has been uploaded for this site at all.",
             "cited_text": "",
             "sop_id": None,
             "ai_mock": True,
@@ -103,7 +108,9 @@ def assess_requirement_coverage(requirement, sop_excerpts):
     system_prompt = (
         "You are a pharmaceutical GMP compliance analyst reviewing sterile/injectable manufacturing SOPs "
         "against a specific regulatory requirement. You are grounding every judgement in the provided SOP "
-        "text only -- never invent SOP content. Respond with strict JSON only, no prose outside the JSON."
+        "text only -- never invent SOP content. The SOPs you're given are not pre-filtered for relevance -- "
+        "some may have nothing to do with this requirement's subject matter, and you must judge that from "
+        "their actual content, not assume relevance. Respond with strict JSON only, no prose outside the JSON."
     )
     excerpt_block = "\n\n".join(
         f"--- SOP [{e['sop_id']}] {e['sop_number']} - {e['title']} ---\n{e['text'][:4000]}" for e in sop_excerpts
@@ -114,13 +121,18 @@ Clause: {requirement['clause']}
 Process area: {requirement['process_area']}
 Requirement text: {requirement['requirement_text']}
 
-Candidate SOPs at this site (only these may be cited):
+Candidate SOPs at this site (only these may be cited -- judge relevance from their actual content, they are not pre-filtered):
 {excerpt_block}
 
-Assess whether the requirement is covered. Respond with JSON exactly in this shape:
+First decide: does ANY of these SOPs actually address this requirement's subject matter at all? If none of
+them are topically relevant (e.g. a visual-inspection SOP being checked against a facility-design or
+sterility-testing requirement), respond with coverage_status "SOP Missing" -- this means "no relevant SOP
+exists to check", which is different from "Not Covered" (which means a relevant SOP exists but falls short).
+Only use "Covered" / "Partially Covered" / "Not Covered" when at least one SOP is genuinely on-topic for this
+requirement. Respond with JSON exactly in this shape:
 {{
-  "coverage_status": "Covered" | "Partially Covered" | "Not Covered",
-  "sop_id": <the sop_id number that is most relevant, or null>,
+  "coverage_status": "Covered" | "Partially Covered" | "Not Covered" | "SOP Missing",
+  "sop_id": <the sop_id number that is most relevant, or null if none are relevant>,
   "cited_text": "<short exact quote from the SOP supporting your assessment, or empty string>",
   "rationale": "<2-3 sentences explaining the assessment in plain language, referencing what is present or missing>"
 }}"""
@@ -132,9 +144,39 @@ Assess whether the requirement is covered. Respond with JSON exactly in this sha
         parsed["ai_mock"] = False
         return parsed
     except AIError:
-        # Deterministic offline fallback: naive keyword overlap heuristic.
-        best = max(sop_excerpts, key=lambda e: _keyword_overlap(requirement["requirement_text"], e["text"]))
-        overlap = _keyword_overlap(requirement["requirement_text"], best["text"])
+        # Deterministic offline fallback. Since matching is no longer
+        # category-pre-filtered, this heuristic now has to judge topical
+        # relevance itself, not just score overlap between two already-related
+        # texts. A generic bag-of-words overlap score is *not* good enough for
+        # that on its own -- a long, real SOP shares plenty of generic GMP
+        # vocabulary ("procedure", "quality", "documented", "batch"...) with
+        # almost any requirement, regardless of actual topic. So: first gate on
+        # whether the requirement's own topic words (from its process_area /
+        # sop_category, which name the subject matter, not generic GMP filler)
+        # appear in the SOP text at all; only compute Covered/Partial/Not
+        # Covered once that relevance gate passes.
+        best, best_overlap, best_relevant = None, -1.0, False
+        for e in sop_excerpts:
+            relevant = _topic_relevant(requirement, e["text"])
+            overlap = _keyword_overlap(requirement["requirement_text"], e["text"])
+            # Prefer any relevant candidate over a non-relevant one, then by overlap.
+            if (relevant, overlap) > (best_relevant, best_overlap):
+                best, best_overlap, best_relevant = e, overlap, relevant
+
+        if not best_relevant:
+            return {
+                "coverage_status": "SOP Missing",
+                "sop_id": None,
+                "cited_text": "",
+                "rationale": (
+                    f"[Offline heuristic mode - no ANTHROPIC_API_KEY configured] None of the checked SOPs "
+                    f"mention terms tied to this requirement's own subject matter ('{requirement.get('process_area','')}' / "
+                    f"'{requirement.get('sop_category','')}'), so none look genuinely relevant to this requirement. "
+                    "This is a placeholder assessment; connect a live Claude API key for real semantic analysis."
+                ),
+                "ai_mock": True,
+            }
+        overlap = best_overlap
         if overlap > 0.35:
             status = "Covered"
         elif overlap > 0.12:
@@ -147,11 +189,36 @@ Assess whether the requirement is covered. Respond with JSON exactly in this sha
             "cited_text": best["text"][:200].strip(),
             "rationale": (
                 f"[Offline heuristic mode - no ANTHROPIC_API_KEY configured] Keyword overlap between the "
-                f"requirement and '{best['title']}' is {overlap:.0%}. This is a placeholder assessment; "
-                f"connect a live Claude API key for real semantic analysis."
+                f"requirement and '{best['title']}' is {overlap:.0%}. "
+                "This is a placeholder assessment; connect a live Claude API key for real semantic analysis."
             ),
             "ai_mock": True,
         }
+
+
+def _topic_relevant(requirement, sop_text):
+    """Relevance gate for the offline heuristic: does the SOP text contain any
+    of the distinctive topic words from this requirement's process_area or
+    sop_category (the words that actually name its subject matter), beyond
+    generic GMP filler that appears in virtually every SOP regardless of
+    topic? This is a coarse stand-in for what a live model judges directly
+    from context -- it only needs to catch the obvious case (a visual
+    inspection SOP has no business being "relevant" to a facility-HVAC
+    requirement), not nuance."""
+    generic = {
+        "the", "and", "of", "to", "for", "a", "in", "or", "with", "is", "are", "be", "that", "shall", "must", "on",
+        "procedure", "procedures", "quality", "product", "products", "process", "processes", "system", "systems",
+        "documented", "document", "documentation", "personnel", "training", "written", "control", "controls",
+        "record", "records", "requirement", "requirements", "including", "appropriate", "ensure", "ensures",
+        "area", "areas", "activity", "activities", "manufacturing", "operation", "operations", "compliance",
+        "standard", "standards", "applicable", "manufacture", "manufactured", "management", "site", "sites",
+    }
+    topic_source = f"{requirement.get('process_area','')} {requirement.get('sop_category','')}"
+    topic_words = set(w.lower().strip(".,()/&") for w in topic_source.split() if len(w) > 3 and w.lower() not in generic)
+    if not topic_words:
+        return True  # no distinguishing topic words to gate on -- don't block, let overlap scoring decide
+    text_lower = sop_text.lower()
+    return any(w in text_lower for w in topic_words)
 
 
 def _keyword_overlap(a, b):
@@ -266,4 +333,77 @@ Draft the SOP procedural text that closes this gap. Respond with JSON exactly in
             ],
             "rationale": "Placeholder text generated without live AI access.",
             "ai_mock": True,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Task 4: Discovery -- suggest regulatory topics not in the curated library
+# ---------------------------------------------------------------------------
+def discover_uncovered_topics(sop_title, sop_category, sop_text, existing_requirement_summaries):
+    """
+    Reads an SOP's actual content and suggests regulatory topics/expectations it
+    would typically need to address that are NOT already tracked in the curated
+    requirements library. This is deliberately separate from RTM: these are
+    unverified candidates for a human to review, never an official finding --
+    a fixed, curated requirement library can never claim to be complete, and an
+    LLM inventing "regulatory requirements" with no human review would be a
+    worse failure mode (an untraceable, unvetted compliance claim) than a known
+    gap in the library.
+
+    existing_requirement_summaries: list of short strings describing what's
+    already tracked for this SOP's category, so the model doesn't just
+    re-suggest things already in the system.
+
+    returns: {"candidates": [...], "ai_mock": bool, "offline_note": str|None}
+    """
+    system_prompt = (
+        "You are a pharmaceutical GMP compliance analyst. You are given the text of an SOP and a list of "
+        "regulatory requirements this platform already tracks for its category. Identify SPECIFIC regulatory "
+        "topics or expectations -- from FDA 21 CFR 210/211, EU GMP Annex 1, WHO GMP, ICH guidelines, USP "
+        "chapters, PDA technical reports, or PIC/S -- that this SOP's subject matter would typically need to "
+        "address, but that are NOT already covered by the tracked requirements listed below. Only suggest "
+        "something if you can name a specific standard/chapter/section it comes from -- do not invent vague "
+        "'best practices' with no citable source. If genuinely nothing looks missing, return an empty list. "
+        "Respond with strict JSON only, no prose outside the JSON."
+    )
+    existing_block = "\n".join(f"- {s}" for s in existing_requirement_summaries) or "(none tracked yet for this category)"
+    user_prompt = f"""SOP: {sop_title} (category: {sop_category})
+SOP text (excerpt):
+{sop_text[:6000]}
+
+Already-tracked requirements for this SOP's category:
+{existing_block}
+
+Respond with JSON exactly in this shape:
+{{
+  "candidates": [
+    {{
+      "topic": "<short topic name, e.g. 'Sub-visible particulate testing'>",
+      "suggested_source": "<specific standard, e.g. 'USP <788>' -- must be a real, nameable source>",
+      "suggested_clause": "<clause/section if you know it, else empty string>",
+      "suggested_category": "<a short category label consistent with the SOP's own category style>",
+      "rationale": "<1-2 sentences: why this SOP's subject matter would need to address this, and why it looks missing from the tracked list>"
+    }}
+  ]
+}}"""
+    try:
+        raw = _call_claude(system_prompt, user_prompt, max_tokens=1200)
+        parsed = _extract_json_object(raw)
+        candidates = parsed.get("candidates")
+        if not isinstance(candidates, list):
+            raise AIError("missing_candidates_list_in_response")
+        return {"candidates": candidates, "ai_mock": False, "offline_note": None}
+    except AIError as e:
+        # Unlike RTM coverage, there is no sensible non-AI substitute for
+        # open-ended "what regulatory topic haven't we thought to check for" --
+        # a keyword-overlap heuristic can rank existing candidates but can't
+        # invent new ones. Be explicit about that instead of faking a result.
+        return {
+            "candidates": [],
+            "ai_mock": True,
+            "offline_note": (
+                f"Discovery requires a live Claude API key ({e}) -- there is no offline heuristic for "
+                "open-ended gap discovery, unlike RTM coverage assessment which has a keyword-overlap "
+                "fallback. Configure ANTHROPIC_API_KEY to use this feature."
+            ),
         }
