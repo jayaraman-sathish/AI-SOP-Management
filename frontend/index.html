@@ -366,6 +366,115 @@ function filesModal() {
   </div>`;
 }
 
+let pendingAttachFiles = []; // [{file, id, doc_type}] -- files staged to add to an SOP that's already uploaded
+
+async function openFilesModal(sopId, sopNumber) {
+  document.getElementById("filesModalTitle").textContent = `Files — ${sopNumber}`;
+  const body = document.getElementById("filesModalBody");
+  body.textContent = "Loading…";
+  document.getElementById("filesModalBg").classList.remove("hidden");
+  pendingAttachFiles = [];
+  try {
+    const sop = await api(`/sops/${sopId}`);
+    const current = (sop.versions || []).find(v => v.is_current) || sop.versions[0];
+    if (!current) { body.innerHTML = `<p class="muted">No files found.</p>`; return; }
+    const attRows = (current.attachments || []).map(a => `
+      <div class="row" style="justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border); margin-bottom:0;">
+        <div>${a.filename} <span class="badge">${a.doc_type}</span></div>
+        <button class="btn small secondary fileDlBtn" data-kind="attachment" data-id="${a.id}" data-name="${a.filename}">Download</button>
+      </div>`).join("") || `<p class="muted">No annexures/formats attached yet — add some below.</p>`;
+    body.innerHTML = `
+      <div class="row" style="justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border); margin-bottom:0;">
+        <div>${current.filename} <span class="badge">Main SOP</span> <span class="muted">(${current.version_label})</span></div>
+        <button class="btn small secondary fileDlBtn" data-kind="version" data-id="${current.id}" data-name="${current.filename}">Download</button>
+      </div>
+      ${attRows}
+      <h4 style="margin-top:16px;">Add Annexure / Format Files</h4>
+      <p class="muted" style="margin-top:0;">Uploaded the main SOP without its annexures? Add them here — no need to re-upload anything.</p>
+      <div id="attachDropZone" style="border:2px dashed var(--navy-light); border-radius:8px; padding:16px; text-align:center; cursor:pointer; background:#FAFBFF; font-size:13px; color:var(--muted);">
+        Drop .docx files here, or click to choose
+        <input id="attachFilesInput" type="file" accept=".docx" multiple style="display:none;" />
+      </div>
+      <div id="attachFileListBody" style="margin-top:8px;"></div>
+      <div class="row" style="justify-content:flex-end; margin-top:6px;">
+        <button class="btn small" id="submitAttachFiles">Add Files</button>
+      </div>
+    `;
+    body.querySelectorAll(".fileDlBtn").forEach(dbtn => {
+      dbtn.onclick = async () => {
+        try {
+          const path = dbtn.dataset.kind === "version" ? `/sop_versions/${dbtn.dataset.id}/download` : `/sop_attachments/${dbtn.dataset.id}/download`;
+          const blob = await api(path);
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url; a.download = dbtn.dataset.name;
+          document.body.appendChild(a); a.click(); a.remove();
+        } catch (e) { toast("Error: " + e.message); }
+      };
+    });
+
+    function renderAttachFileList() {
+      const el = document.getElementById("attachFileListBody");
+      if (!el) return;
+      if (!pendingAttachFiles.length) { el.innerHTML = `<div class="muted" style="padding:4px 0;">No files added yet.</div>`; return; }
+      el.innerHTML = pendingAttachFiles.map(pf => `
+        <div class="row" style="justify-content:space-between; padding:4px 0; border-bottom:1px solid var(--border); margin-bottom:0;">
+          <div style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${pf.file.name} <span class="muted">(${Math.round(pf.file.size/1024)} KB)</span></div>
+          <select class="attachTypeSelect" data-id="${pf.id}" style="width:120px;">${["Annexure", "Format", "Other"].map(t => `<option value="${t}" ${t === pf.doc_type ? "selected" : ""}>${t}</option>`).join("")}</select>
+          <button class="btn small secondary removeAttachBtn" data-id="${pf.id}">Remove</button>
+        </div>`).join("");
+      el.querySelectorAll(".attachTypeSelect").forEach(sel => {
+        sel.onchange = () => { const pf = pendingAttachFiles.find(p => p.id === sel.dataset.id); if (pf) pf.doc_type = sel.value; };
+      });
+      el.querySelectorAll(".removeAttachBtn").forEach(rbtn => {
+        rbtn.onclick = () => { pendingAttachFiles = pendingAttachFiles.filter(p => p.id !== rbtn.dataset.id); renderAttachFileList(); };
+      });
+    }
+
+    const attachDropZone = document.getElementById("attachDropZone");
+    const attachFilesInput = document.getElementById("attachFilesInput");
+    attachDropZone.onclick = () => attachFilesInput.click();
+    attachFilesInput.onchange = () => {
+      Array.from(attachFilesInput.files).filter(f => /\.docx$/i.test(f.name)).forEach(file => {
+        pendingAttachFiles.push({ file, id: Math.random().toString(36).slice(2), doc_type: "Annexure" });
+      });
+      attachFilesInput.value = "";
+      renderAttachFileList();
+    };
+    attachDropZone.ondragover = (e) => { e.preventDefault(); attachDropZone.style.background = "#EEF2FC"; };
+    attachDropZone.ondragleave = () => { attachDropZone.style.background = "#FAFBFF"; };
+    attachDropZone.ondrop = (e) => {
+      e.preventDefault();
+      attachDropZone.style.background = "#FAFBFF";
+      if (e.dataTransfer && e.dataTransfer.files) {
+        Array.from(e.dataTransfer.files).filter(f => /\.docx$/i.test(f.name)).forEach(file => {
+          pendingAttachFiles.push({ file, id: Math.random().toString(36).slice(2), doc_type: "Annexure" });
+        });
+        renderAttachFileList();
+      }
+    };
+    renderAttachFileList();
+
+    document.getElementById("submitAttachFiles").onclick = async () => {
+      if (!pendingAttachFiles.length) { toast("Add at least one .docx file first."); return; }
+      const submitBtn = document.getElementById("submitAttachFiles");
+      submitBtn.disabled = true; submitBtn.textContent = "Uploading…";
+      try {
+        const files = await Promise.all(pendingAttachFiles.map(async pf => ({
+          filename: pf.file.name, doc_type: pf.doc_type, file_base64: await readFileAsBase64(pf.file),
+        })));
+        const res = await api(`/sop_versions/${current.id}/attachments`, { method: "POST", body: JSON.stringify({ files }) });
+        toast(`Added ${res.attachments_saved} file(s) to ${sopNumber}.`);
+        pendingAttachFiles = [];
+        openFilesModal(sopId, sopNumber); // refresh the modal in place with the new attachment list
+      } catch (e) {
+        toast("Error: " + e.message);
+        submitBtn.disabled = false; submitBtn.textContent = "Add Files";
+      }
+    };
+  } catch (e) { body.innerHTML = `<p class="muted">Error loading files: ${e.message}</p>`; }
+}
+
 function editSopModal() {
   return `
   <div id="editModalBg" class="modal-bg hidden">
@@ -431,10 +540,12 @@ function addFiles(fileList) {
 
 function uploadModal() {
   pendingFiles = [];
+  const siteOptions = state.sites.map(s => `<option value="${s.id}" ${s.id === state.currentSiteId ? "selected" : ""}>${s.code} — ${s.name}</option>`).join("");
   return `
   <div id="uploadModal" class="modal-bg hidden">
     <div class="modal" style="width:600px;">
       <h3>Upload SOP Package</h3>
+      <div class="field"><label>Plant / Site — this SOP belongs to</label><select id="f_site_id">${siteOptions}</select></div>
       <div class="field"><label>SOP Number</label><input id="f_sop_number" placeholder="e.g. SOP-QC-014" /></div>
       <div class="field"><label>Title</label><input id="f_title" placeholder="e.g. Aseptic Process Simulation (Media Fill)" /></div>
       <div class="field"><label>Process Area</label><input id="f_process_area" placeholder="e.g. Aseptic Process Simulation" /></div>
@@ -516,7 +627,7 @@ async function comparisonView() {
   return `
     <div class="card">
       <h2>Site-to-Site Comparison</h2>
-      <p class="muted">Compares SOPs sharing the same category across sites and classifies each difference (needs the same SOP category uploaded at 2+ sites).</p>
+      <p class="muted">This looks across <b>every plant</b>, not just the one selected in the top-right switcher — pick a category below and it pulls in that category's SOP from any plant that has one. Compares SOPs sharing the same category across sites and classifies each difference (needs the same SOP category uploaded at 2+ sites).</p>
       <div class="row">
         <select id="compareCategory"><option value="">Select SOP category…</option>${catOptions}</select>
         <button class="btn" id="runCompareBtn">Run Comparison</button>
@@ -629,41 +740,7 @@ function bindTabHandlers() {
   }
 
   document.querySelectorAll(".viewFilesBtn").forEach(btn => {
-    btn.onclick = async () => {
-      document.getElementById("filesModalTitle").textContent = `Files — ${btn.dataset.number}`;
-      const body = document.getElementById("filesModalBody");
-      body.textContent = "Loading…";
-      document.getElementById("filesModalBg").classList.remove("hidden");
-      try {
-        const sop = await api(`/sops/${btn.dataset.sop}`);
-        const current = (sop.versions || []).find(v => v.is_current) || sop.versions[0];
-        if (!current) { body.innerHTML = `<p class="muted">No files found.</p>`; return; }
-        const attRows = (current.attachments || []).map(a => `
-          <div class="row" style="justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border); margin-bottom:0;">
-            <div>${a.filename} <span class="badge">${a.doc_type}</span></div>
-            <button class="btn small secondary fileDlBtn" data-kind="attachment" data-id="${a.id}" data-name="${a.filename}">Download</button>
-          </div>`).join("") || `<p class="muted">No annexures/formats attached.</p>`;
-        body.innerHTML = `
-          <div class="row" style="justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border); margin-bottom:0;">
-            <div>${current.filename} <span class="badge">Main SOP</span> <span class="muted">(${current.version_label})</span></div>
-            <button class="btn small secondary fileDlBtn" data-kind="version" data-id="${current.id}" data-name="${current.filename}">Download</button>
-          </div>
-          ${attRows}
-        `;
-        body.querySelectorAll(".fileDlBtn").forEach(dbtn => {
-          dbtn.onclick = async () => {
-            try {
-              const path = dbtn.dataset.kind === "version" ? `/sop_versions/${dbtn.dataset.id}/download` : `/sop_attachments/${dbtn.dataset.id}/download`;
-              const blob = await api(path);
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement("a");
-              a.href = url; a.download = dbtn.dataset.name;
-              document.body.appendChild(a); a.click(); a.remove();
-            } catch (e) { toast("Error: " + e.message); }
-          };
-        });
-      } catch (e) { body.innerHTML = `<p class="muted">Error loading files: ${e.message}</p>`; }
-    };
+    btn.onclick = () => openFilesModal(btn.dataset.sop, btn.dataset.number);
   });
   const closeFilesModal = document.getElementById("closeFilesModal");
   if (closeFilesModal) closeFilesModal.onclick = () => document.getElementById("filesModalBg").classList.add("hidden");
@@ -783,6 +860,8 @@ function readFileAsBase64(file) {
 
 async function doUploadSop() {
   if (!pendingFiles.length) { toast("Add at least one .docx file (drag & drop or click the drop zone)."); return; }
+  const site_id = parseInt(document.getElementById("f_site_id").value, 10);
+  if (!site_id) { toast("Select which plant this SOP belongs to."); return; }
   const sop_number = document.getElementById("f_sop_number").value.trim();
   const title = document.getElementById("f_title").value.trim();
   if (!sop_number || !title) { toast("SOP number and title are required."); return; }
@@ -809,16 +888,18 @@ async function doUploadSop() {
     const res = await api("/sops", {
       method: "POST",
       body: JSON.stringify({
-        site_id: state.currentSiteId, sop_number, title,
+        site_id, sop_number, title,
         process_area: document.getElementById("f_process_area").value.trim(),
         sop_category: document.getElementById("f_sop_category").value.trim(),
         version_label: document.getElementById("f_version").value.trim() || "v1.0",
         files,
       }),
     });
-    toast(`SOP package uploaded — main document plus ${res.attachments_saved} attachment(s).`);
+    const uploadedSite = state.sites.find(s => s.id === site_id);
+    toast(`SOP package uploaded to ${uploadedSite ? uploadedSite.code : "plant"} — main document plus ${res.attachments_saved} attachment(s).`);
     document.getElementById("uploadModal").classList.add("hidden");
     pendingFiles = [];
+    state.currentSiteId = site_id; // switch the whole app to the plant you just uploaded for, so you land on it in the repository
     renderTab();
   } catch (e) {
     toast("Error: " + e.message);

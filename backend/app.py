@@ -429,6 +429,53 @@ def download_sop_attachment(attachment_id):
     return send_file(attachment["filepath"], as_attachment=True, download_name=attachment["filename"])
 
 
+@app.route("/api/sop_versions/<int:version_id>/attachments", methods=["POST"])
+@require_auth(roles=["admin", "analyst", "site_owner"])
+def add_sop_attachments(version_id):
+    """Adds one or more annexure/format files to an SOP *after* the initial
+    upload -- e.g. you uploaded just the main SOP and now have the annexures
+    to hand, or realized one was missing. Does not touch the main document or
+    require re-uploading anything already there."""
+    conn = db.get_db()
+    version = conn.execute("SELECT * FROM sop_versions WHERE id=?", (version_id,)).fetchone()
+    if not version:
+        conn.close()
+        return jsonify({"error": "version_not_found"}), 404
+
+    data = request.get_json(force=True)
+    files_payload = data.get("files")
+    if not isinstance(files_payload, list) or len(files_payload) == 0:
+        conn.close()
+        return jsonify({"error": "files_must_be_a_non_empty_array"}), 400
+
+    sop_id = version["sop_id"]
+    saved = 0
+    for f in files_payload:
+        try:
+            file_bytes = base64.b64decode(f["file_base64"])
+        except Exception:
+            continue  # skip a bad file rather than failing the whole batch
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", f.get("filename") or "attachment.docx")
+        stored_name = f"sop{sop_id}_{secrets.token_hex(4)}_{safe_name}"
+        filepath = os.path.join(UPLOAD_DIR, stored_name)
+        with open(filepath, "wb") as out:
+            out.write(file_bytes)
+        extracted_text = docx_service.extract_text(filepath) if filepath.lower().endswith(".docx") else ""
+        doc_type = (f.get("doc_type") or "Annexure").strip() or "Annexure"
+        conn.execute(
+            "INSERT INTO sop_attachments (sop_version_id, doc_type, filename, filepath, extracted_text, uploaded_by, uploaded_at) VALUES (?,?,?,?,?,?,?)",
+            (version_id, doc_type, f.get("filename") or safe_name, filepath, extracted_text, actor_label(), db.now()),
+        )
+        saved += 1
+
+    conn.commit()
+    conn.close()
+    if saved == 0:
+        return jsonify({"error": "no_valid_files"}), 400
+    db.log_audit(actor_label(), "add_attachments", "sop_version", version_id, {"sop_id": sop_id, "attachments_added": saved})
+    return jsonify({"attachments_saved": saved}), 201
+
+
 # ---------------------------------------------------------------------------
 # RTM: AI-assisted requirement-to-SOP mapping
 # ---------------------------------------------------------------------------
