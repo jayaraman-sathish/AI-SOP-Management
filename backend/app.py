@@ -89,7 +89,19 @@ def handle_unexpected_error(e):
 
 @app.route("/", methods=["GET"])
 def serve_frontend():
-    return send_from_directory(FRONTEND_DIR, "index.html")
+    # This whole app is a single HTML file that keeps running client-side JS
+    # in memory once loaded -- a browser that cached this file (or a tab left
+    # open from before a deploy) will keep executing OLD code indefinitely,
+    # with zero indication anything is stale. That's caused real confusion
+    # this project: features that were actually live on the server looked
+    # "not working" because the open tab was still running yesterday's JS.
+    # Force every load to revalidate with the server instead of silently
+    # serving a cached copy.
+    resp = send_from_directory(FRONTEND_DIR, "index.html")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.after_request
@@ -544,9 +556,16 @@ def discover_gaps(sop_id):
     if not full_text:
         conn.close()
         return jsonify({"error": "sop_has_no_extracted_text"}), 400
-    existing = conn.execute(
-        "SELECT source, clause, requirement_text FROM requirements WHERE sop_category=?", (sop["sop_category"],)
-    ).fetchall()
+    # Deliberately NOT filtered by an exact sop_category string match -- that
+    # was the bug: this SOP's category ("Visual Inspection") doesn't exactly
+    # match the library's tag for USP <790>/<1790>/PDA TR 79 ("Visual
+    # Inspection (Manual)"), so the AI was told nothing was tracked yet and
+    # kept "discovering" those exact three requirements again, even though
+    # they'd just been evaluated against this same SOP in a Check Compliance
+    # run. The library is small (tens of items), so it's cheap to just pass
+    # all of it -- same content-driven-not-category-tag-driven philosophy
+    # already used for RTM matching, applied here too.
+    existing = conn.execute("SELECT source, clause, requirement_text FROM requirements").fetchall()
     existing_summaries = [f"{r['source']} {r['clause']}: {r['requirement_text'][:100]}" for r in existing]
 
     result = ai_service.discover_uncovered_topics(sop["title"], sop["sop_category"], full_text, existing_summaries)
