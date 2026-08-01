@@ -141,6 +141,16 @@ First decide: does ANY of these SOPs actually address this requirement's subject
 them are topically relevant (e.g. a visual-inspection SOP being checked against a facility-design or
 sterility-testing requirement), respond with coverage_status "SOP Missing" -- this means "no relevant SOP
 exists to check", which is different from "Not Covered" (which means a relevant SOP exists but falls short).
+
+Do NOT confuse "this SOP doesn't fully or adequately describe the procedure" with "this SOP isn't the right
+document." Those are different judgments. If the SOP's own subject matter clearly overlaps with the
+requirement's subject matter -- e.g. a SOP titled/scoped as visual inspection of injectable products being
+checked against a visible-particulate-inspection or visual-inspection-conditions requirement -- that SOP is
+topically relevant BY DEFINITION, even if its content is thin, generic, or missing key procedural details.
+In that case the correct status is "Not Covered" or "Partially Covered" (a relevant SOP exists but falls
+short), never "SOP Missing". Reserve "SOP Missing" strictly for cases where the checked SOP(s) are about a
+genuinely different subject (e.g. checking a training-records SOP against a sterilization-validation
+requirement) -- not as a way to express "this SOP is inadequate."
 Only use "Covered" / "Partially Covered" / "Not Covered" when at least one SOP is genuinely on-topic for this
 requirement. Respond with JSON exactly in this shape:
 {{
