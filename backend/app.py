@@ -864,28 +864,34 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor, requested_sources=No
         try:
             report_sop = sops[0] if len(sops) == 1 else {"sop_number": "Multiple SOPs", "title": f"{len(sops)} SOPs checked", "sop_category": ""}
             initiated_at = db.now()
+            regulations_checked = list(requested_sources) if requested_sources else sorted({r["source"] for r in requirements})
+            title = f"Compliance Report — {report_sop['sop_number']} — {site['code']}"
+            # Reserve the reports row FIRST (filepaths filled in after) so the
+            # report's own ID is known before the documents are generated --
+            # lets the ID be printed inside the docx itself, so a downloaded
+            # file can be cross-referenced back to the Reports tab / Audit
+            # Trail without needing to still have the browser tab open.
+            cur = conn.execute(
+                "INSERT INTO reports (report_type, site_id, sop_id, title, filepath, summary_filepath, created_by, created_at, regulations_json) VALUES (?,?,?,?,?,?,?,?,?)",
+                ("compliance_check", site_id, sops[0]["sop_id"] if len(sops) == 1 else None, title, "", "", actor, initiated_at, json.dumps(regulations_checked)),
+            )
+            report_id = cur.lastrowid
             stored_name = f"compliance_report_site{site_id}_{secrets.token_hex(4)}.docx"
             report_path = os.path.join(GEN_DIR, stored_name)
-            regulations_checked = list(requested_sources) if requested_sources else sorted({r["source"] for r in requirements})
             report_service.generate_compliance_report(
                 report_path, report_sop, dict(site), results,
                 ai_mock_any=any(r.get("ai_mock") for r in results),
                 general_issues=general_issues, general_ai_mock=general_ai_mock, general_offline_note=general_offline_note,
-                initiated_by=actor, initiated_at=initiated_at, regulations_checked=regulations_checked,
+                initiated_by=actor, initiated_at=initiated_at, regulations_checked=regulations_checked, report_id=report_id,
             )
             summary_name = f"compliance_summary_site{site_id}_{secrets.token_hex(4)}.docx"
             summary_path = os.path.join(GEN_DIR, summary_name)
             report_service.generate_compliance_summary_report(
                 summary_path, report_sop, dict(site), results,
-                general_issues=general_issues, initiated_by=actor, initiated_at=initiated_at, regulations_checked=regulations_checked,
+                general_issues=general_issues, initiated_by=actor, initiated_at=initiated_at, regulations_checked=regulations_checked, report_id=report_id,
             )
-            title = f"Compliance Report — {report_sop['sop_number']} — {site['code']}"
-            cur = conn.execute(
-                "INSERT INTO reports (report_type, site_id, sop_id, title, filepath, summary_filepath, created_by, created_at, regulations_json) VALUES (?,?,?,?,?,?,?,?,?)",
-                ("compliance_check", site_id, sops[0]["sop_id"] if len(sops) == 1 else None, title, report_path, summary_path, actor, initiated_at, json.dumps(regulations_checked)),
-            )
+            conn.execute("UPDATE reports SET filepath=?, summary_filepath=? WHERE id=?", (report_path, summary_path, report_id))
             conn.commit()
-            report_id = cur.lastrowid
             # Distinct, explicit audit entry so "was a report generated, and when"
             # is answerable from the Audit Trail tab without having to infer it
             # from the Reports tab or guess whether generation silently failed.
@@ -896,6 +902,13 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor, requested_sources=No
         except Exception as e:
             db.log_error("compliance_report_generation", f"{type(e).__name__}: {e}", traceback_text=traceback.format_exc(), context={"site_id": site_id})
             db.log_audit(actor, "report_generation_failed", "site", site_id, {"error": f"{type(e).__name__}: {e}"})
+            if report_id is not None:
+                # The reports row was reserved (to embed its ID in the docx)
+                # but generation failed partway through -- don't leave a ghost
+                # row with an empty filepath sitting in the Reports tab.
+                conn.execute("DELETE FROM reports WHERE id=?", (report_id,))
+                conn.commit()
+                report_id = None
 
         job.update(status="done", results=results, failed=failed, report_id=report_id, general_issues=general_issues,
                    report_generation_failed=(report_id is None))
@@ -1057,19 +1070,29 @@ def run_comparison():
     report_id = None
     title = f"Comparison Report — {', '.join(r['sop_number'] for r in rows)}"
     try:
+        # Reserve the reports row first (empty filepath) so the report's own
+        # ID is known before the docx is generated and can be printed inside
+        # it -- a downloaded file can then be cross-referenced back to the
+        # Reports tab / Audit Trail on its own, without the browser tab.
+        cur = conn.execute(
+            "INSERT INTO reports (report_type, site_id, sop_id, title, filepath, created_by, created_at) VALUES (?,?,?,?,?,?,?)",
+            ("comparison", None, None, title, "", actor_label(), db.now()),
+        )
+        report_id = cur.lastrowid
         sops_compared = [{"site_code": r["site_code"], "site_name": r["site_name"], "sop_number": r["sop_number"], "title": r["title"]} for r in rows]
         stored_name = f"comparison_report_{secrets.token_hex(4)}.docx"
         report_path = os.path.join(GEN_DIR, stored_name)
-        report_service.generate_comparison_report(report_path, sops_compared, result["findings"], ai_mock=result.get("ai_mock", False))
-        cur = conn.execute(
-            "INSERT INTO reports (report_type, site_id, sop_id, title, filepath, created_by, created_at) VALUES (?,?,?,?,?,?,?)",
-            ("comparison", None, None, title, report_path, actor_label(), db.now()),
-        )
-        report_id = cur.lastrowid
+        report_service.generate_comparison_report(report_path, sops_compared, result["findings"], ai_mock=result.get("ai_mock", False), report_id=report_id)
+        conn.execute("UPDATE reports SET filepath=? WHERE id=?", (report_path, report_id))
+        conn.commit()
         db.log_audit(actor_label(), "report_generated", "report", report_id, {"title": title, "kind": "comparison"})
     except Exception as e:
         db.log_error("comparison_report_generation", f"{type(e).__name__}: {e}", traceback_text=traceback.format_exc(), context={"sop_ids": sop_ids})
         db.log_audit(actor_label(), "report_generation_failed", "sop_ids", None, {"sop_ids": sop_ids, "error": f"{type(e).__name__}: {e}"})
+        if report_id is not None:
+            conn.execute("DELETE FROM reports WHERE id=?", (report_id,))
+            conn.commit()
+            report_id = None
 
     for finding in result["findings"]:
         conn.execute(

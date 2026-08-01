@@ -628,7 +628,7 @@ function uploadModal() {
   <div id="regulationsModalBg" class="modal-bg hidden">
     <div class="modal" style="width:520px;">
       <h3>Which regulations apply to this SOP?</h3>
-      <p class="muted" style="margin-top:0;">Not every regulatory framework applies to every SOP or site (e.g. EU GMP Annex 1 is sterile-only, USP &lt;790&gt;/&lt;1790&gt; is injectables-only). Pick the framework(s) relevant here — Check Compliance will only evaluate requirements from what you select, and the report will record your selection.</p>
+      <p class="muted" style="margin-top:0;">Not every regulatory framework applies to every SOP or site (e.g. EU GMP Annex 1 is sterile-only, USP &lt;790&gt;/&lt;1790&gt; is injectables-only). Nothing is pre-checked — pick only the framework(s) that genuinely apply here. Checking everything re-runs the full 45-item library and produces a report dominated by "Not Applicable" noise, same as before this picker existed. Check Compliance will only evaluate what you select, and the report will record your selection.</p>
       <div class="row" style="justify-content:flex-start; gap:8px; margin-bottom:8px;">
         <button class="btn small secondary" id="regsSelectAll">Select All</button>
         <button class="btn small secondary" id="regsSelectNone">Select None</button>
@@ -779,14 +779,15 @@ async function discoveryView() {
       <td>${c.topic}</td>
       <td>${[c.suggested_source, c.suggested_clause].filter(Boolean).join(" ")}<br/><span class="muted">${c.suggested_category || ""}</span></td>
       <td style="max-width:260px;">${c.rationale || ""}</td>
-      <td><span class="badge ${c.status === 'Promoted' ? 'Covered' : c.status === 'Dismissed' ? 'NotAssessed' : 'mock'}">${c.status}</span></td>
+      <td>${(c.created_at || "").slice(0,16).replace("T", " ")}</td>
+      <td><span class="badge ${c.status === 'Promoted' ? 'Covered' : c.status === 'Dismissed' ? 'NotAssessed' : 'mock'}">${c.status}</span>${c.status !== "New" ? `<br/><span class="muted" style="font-size:11px;">${(c.reviewed_at || "").slice(0,16).replace("T", " ")}</span>` : ""}</td>
       <td>${c.status === "New" && canReview ? `
         <button class="btn small promoteCandBtn" data-cand="${c.id}">Promote to Library</button>
         <button class="btn small secondary dismissCandBtn" data-cand="${c.id}">Dismiss</button>
-      ` : c.status === "Promoted" ? `<span class="muted">now ${c.req_code || "in library"}</span>` : c.status === "New" ? `<span class="muted">needs admin/quality_lead review</span>` : `<span class="muted">by ${c.reviewed_by || ""}</span>`}</td>
+      ` : c.status === "Promoted" ? `<span class="muted">now ${c.req_code || "in library"} — will be checked on future Check Compliance runs where that regulation is selected</span>` : c.status === "New" ? `<span class="muted">needs admin/quality_lead review</span>` : `<span class="muted">by ${c.reviewed_by || ""}</span>`}</td>
     </tr>
     <tr class="promoteFormRow hidden" data-cand-form="${c.id}">
-      <td colspan="6">
+      <td colspan="7">
         <div class="row" style="flex-wrap:wrap; gap:8px;">
           <div class="field"><label>Source</label><input class="promote_source" value="${(c.suggested_source||"").replace(/"/g,'&quot;')}" style="width:160px;" /></div>
           <div class="field"><label>Clause</label><input class="promote_clause" value="${(c.suggested_clause||"").replace(/"/g,'&quot;')}" style="width:120px;" /></div>
@@ -796,12 +797,12 @@ async function discoveryView() {
           <button class="btn small secondary cancelPromoteBtn" data-cand="${c.id}">Cancel</button>
         </div>
       </td>
-    </tr>`).join("") || `<tr><td colspan="6" class="muted">No suggestions yet — click "Discover Additional Requirements" on an SOP in SOP Repository to check.</td></tr>`;
+    </tr>`).join("") || `<tr><td colspan="7" class="muted">No suggestions yet — click "Discover Additional Requirements" on an SOP in SOP Repository to check.</td></tr>`;
   return `
     <div class="card">
       <h2>Suggested Requirements — ${siteLabel()}</h2>
-      <p class="muted">These are AI-suggested regulatory topics found while reading an SOP's actual content that aren't yet in the curated requirement library RTM checks against. They are <b>not</b> official findings — nothing here affects RTM, Gaps, or coverage stats until ${canReview ? "you" : "an admin or quality lead"} reviews and promotes it into the real library below.</p>
-      <table><thead><tr><th>SOP</th><th>Topic</th><th>Suggested Source / Clause</th><th>Rationale</th><th>Status</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>
+      <p class="muted">These are AI-suggested regulatory topics found while reading an SOP's actual content that aren't yet in the curated requirement library RTM checks against. They are <b>not</b> official findings — nothing here affects RTM, Gaps, or coverage stats until ${canReview ? "you" : "an admin or quality lead"} reviews and promotes it into the real library below. <b>Promote</b> adds it as a new requirement under the Source you set (it will then be offered as a checkbox in the regulations picker on future Check Compliance runs, and evaluated against SOPs going forward). <b>Dismiss</b> discards it permanently — use this for suggestions that don't actually apply.</p>
+      <table><thead><tr><th>SOP</th><th>Topic</th><th>Suggested Source / Clause</th><th>Rationale</th><th>Discovered</th><th>Status</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
   `;
 }
@@ -923,7 +924,7 @@ async function openRegulationsModal(btn) {
     if (!sources.length) { body.innerHTML = `<p class="muted">No requirement library entries found.</p>`; return; }
     body.innerHTML = sources.map(s => `
       <label style="display:block; padding:5px 0;">
-        <input type="checkbox" class="regSourceCheck" value="${(s.source||"").replace(/"/g,'&quot;')}" checked />
+        <input type="checkbox" class="regSourceCheck" value="${(s.source||"").replace(/"/g,'&quot;')}" />
         ${s.source} <span class="muted">(${s.count})</span>
       </label>`).join("");
   } catch (e) {

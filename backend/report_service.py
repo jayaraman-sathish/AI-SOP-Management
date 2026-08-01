@@ -55,7 +55,7 @@ def _title_block(doc, title, subtitle):
 
 def generate_compliance_report(output_path, sop, site, rtm_results, ai_mock_any=False,
                                 general_issues=None, general_ai_mock=False, general_offline_note=None,
-                                initiated_by=None, initiated_at=None, regulations_checked=None):
+                                initiated_by=None, initiated_at=None, regulations_checked=None, report_id=None):
     """
     sop: dict with sop_number, title, sop_category
     site: dict with code, name
@@ -75,6 +75,12 @@ def generate_compliance_report(output_path, sop, site, rtm_results, ai_mock_any=
         "SOP Compliance Report",
         f"{sop['sop_number']} — {sop['title']}  |  {site['code']} — {site['name']}",
     )
+    if report_id is not None:
+        idp = doc.add_paragraph()
+        idr = idp.add_run(f"Report ID: RPT-{report_id}  (look this up in the app's Reports tab or Audit Trail to verify this document and confirm when it was generated)")
+        idr.bold = True
+        idr.font.size = Pt(9)
+        idr.font.color.rgb = NAVY
     if initiated_by or initiated_at:
         meta = doc.add_paragraph()
         mr = meta.add_run(f"Initiated by {initiated_by or 'unknown'} on {initiated_at or 'unknown'}")
@@ -198,7 +204,7 @@ def _general_issues_table(doc, issues, empty_note):
 
 
 def generate_compliance_summary_report(output_path, sop, site, rtm_results, general_issues=None,
-                                        initiated_by=None, initiated_at=None, regulations_checked=None):
+                                        initiated_by=None, initiated_at=None, regulations_checked=None, report_id=None):
     """
     A short, one-page companion to the full Compliance Report -- who ran it,
     when, and the headline numbers, without the detailed per-requirement
@@ -213,6 +219,12 @@ def generate_compliance_summary_report(output_path, sop, site, rtm_results, gene
         "SOP Compliance Summary",
         f"{sop['sop_number']} — {sop['title']}  |  {site['code']} — {site['name']}",
     )
+    if report_id is not None:
+        idp = doc.add_paragraph()
+        idr = idp.add_run(f"Report ID: RPT-{report_id}  (look this up in the app's Reports tab or Audit Trail to verify this document and confirm when it was generated)")
+        idr.bold = True
+        idr.font.size = Pt(9)
+        idr.font.color.rgb = NAVY
     meta = doc.add_paragraph()
     mr = meta.add_run(f"Initiated by {initiated_by or 'unknown'} on {initiated_at or 'unknown'}")
     mr.font.size = Pt(9)
@@ -300,7 +312,7 @@ def _result_table(doc, results, empty_note, compact=False):
             _set_cell_text(row.cells[2], (r.get("requirement_text") or "")[:200], size=9)
 
 
-def generate_comparison_report(output_path, sops_compared, findings, ai_mock=False):
+def generate_comparison_report(output_path, sops_compared, findings, ai_mock=False, report_id=None):
     """
     sops_compared: list of {site_code, site_name, sop_number, title}
     findings: list of {process_step, site_values (dict), classification, note}
@@ -308,6 +320,13 @@ def generate_comparison_report(output_path, sops_compared, findings, ai_mock=Fal
     doc = Document()
     scope = "; ".join(f"{s['site_code']} — {s['sop_number']} {s['title']}" for s in sops_compared)
     _title_block(doc, "SOP Site Comparison Report", scope)
+
+    if report_id is not None:
+        idp = doc.add_paragraph()
+        idr = idp.add_run(f"Report ID: RPT-{report_id}  (look this up in the app's Reports tab or Audit Trail to verify this document and confirm when it was generated)")
+        idr.bold = True
+        idr.font.size = Pt(9)
+        idr.font.color.rgb = NAVY
 
     if ai_mock:
         warn = doc.add_paragraph()
