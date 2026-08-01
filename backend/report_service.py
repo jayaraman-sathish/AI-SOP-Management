@@ -55,7 +55,7 @@ def _title_block(doc, title, subtitle):
 
 def generate_compliance_report(output_path, sop, site, rtm_results, ai_mock_any=False,
                                 general_issues=None, general_ai_mock=False, general_offline_note=None,
-                                initiated_by=None, initiated_at=None):
+                                initiated_by=None, initiated_at=None, regulations_checked=None):
     """
     sop: dict with sop_number, title, sop_category
     site: dict with code, name
@@ -63,8 +63,12 @@ def generate_compliance_report(output_path, sop, site, rtm_results, ai_mock_any=
         (the same shape returned by the RTM background job's "results" list)
     general_issues: list of {issue_type, location, current_text, proposed_correction, why_needed} --
         writing-quality/completeness findings, independent of any specific regulatory requirement.
+    regulations_checked: list of regulatory framework/"source" names the user selected for this run
+        (e.g. ["FDA 21 CFR 211", "USP <790>"]) -- the run only evaluates requirements from these,
+        instead of blindly running the entire requirement library regardless of relevance.
     """
     general_issues = general_issues or []
+    regulations_checked = regulations_checked or []
     doc = Document()
     _title_block(
         doc,
@@ -76,6 +80,11 @@ def generate_compliance_report(output_path, sop, site, rtm_results, ai_mock_any=
         mr = meta.add_run(f"Initiated by {initiated_by or 'unknown'} on {initiated_at or 'unknown'}")
         mr.font.size = Pt(9)
         mr.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+    if regulations_checked:
+        regs = doc.add_paragraph()
+        rr = regs.add_run(f"Regulations checked in this run: {', '.join(regulations_checked)}")
+        rr.font.size = Pt(9)
+        rr.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
 
     if ai_mock_any:
         warn = doc.add_paragraph()
@@ -91,9 +100,13 @@ def generate_compliance_report(output_path, sop, site, rtm_results, ai_mock_any=
     total = len(rtm_results)
     checked = total - counts.get("SOP Missing", 0)
 
+    scope_note = (
+        f"across the {len(regulations_checked)} selected regulation(s)" if regulations_checked
+        else "across the full requirement library"
+    )
     summary = doc.add_paragraph()
     sr = summary.add_run(
-        f"{total} regulatory requirements evaluated. {checked} were within this SOP's actual scope "
+        f"{total} regulatory requirements evaluated {scope_note}. {checked} were within this SOP's actual scope "
         f"(the rest are correctly not applicable -- this SOP wasn't relevant to their subject matter). "
         f"Of those in scope: {counts.get('Covered', 0)} Covered, {counts.get('Partially Covered', 0)} "
         f"Partially Covered, {counts.get('Not Covered', 0)} Not Covered."
@@ -185,7 +198,7 @@ def _general_issues_table(doc, issues, empty_note):
 
 
 def generate_compliance_summary_report(output_path, sop, site, rtm_results, general_issues=None,
-                                        initiated_by=None, initiated_at=None):
+                                        initiated_by=None, initiated_at=None, regulations_checked=None):
     """
     A short, one-page companion to the full Compliance Report -- who ran it,
     when, and the headline numbers, without the detailed per-requirement
@@ -193,6 +206,7 @@ def generate_compliance_summary_report(output_path, sop, site, rtm_results, gene
     reviewer who just wants the top line doesn't have to open the full report.
     """
     general_issues = general_issues or []
+    regulations_checked = regulations_checked or []
     doc = Document()
     _title_block(
         doc,
@@ -203,6 +217,11 @@ def generate_compliance_summary_report(output_path, sop, site, rtm_results, gene
     mr = meta.add_run(f"Initiated by {initiated_by or 'unknown'} on {initiated_at or 'unknown'}")
     mr.font.size = Pt(9)
     mr.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+    if regulations_checked:
+        regs = doc.add_paragraph()
+        rr = regs.add_run(f"Regulations checked in this run: {', '.join(regulations_checked)}")
+        rr.font.size = Pt(9)
+        rr.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
     doc.add_paragraph()
 
     counts = {}
@@ -212,8 +231,12 @@ def generate_compliance_summary_report(output_path, sop, site, rtm_results, gene
     checked = total - counts.get("SOP Missing", 0)
 
     cols = ["Metric", "Count"]
+    scope_label = (
+        f"Regulatory requirements evaluated ({len(regulations_checked)} regulation(s) selected)"
+        if regulations_checked else "Regulatory requirements evaluated (full library)"
+    )
     stat_rows = [
-        ("Regulatory requirements evaluated", total),
+        (scope_label, total),
         ("Within this SOP's actual scope", checked),
         ("Compliant", counts.get("Covered", 0)),
         ("Partially Compliant", counts.get("Partially Covered", 0)),

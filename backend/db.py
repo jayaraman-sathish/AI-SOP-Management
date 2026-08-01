@@ -232,6 +232,7 @@ def _migrate(conn):
     just no-ops here."""
     migrations = [
         "ALTER TABLE reports ADD COLUMN summary_filepath TEXT",
+        "ALTER TABLE reports ADD COLUMN regulations_json TEXT",
     ]
     for stmt in migrations:
         try:

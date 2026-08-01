@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import base64
 import hashlib
 import secrets
@@ -682,7 +683,7 @@ def list_rtm():
     return jsonify(db.rows_to_list(rows))
 
 
-def _run_rtm_job(job_id, site_id, requested_sop_ids, actor):
+def _run_rtm_job(job_id, site_id, requested_sop_ids, actor, requested_sources=None):
     """Background worker for an RTM run -- see run_rtm_mapping for why this
     doesn't run inline in the request. Runs in its own thread with its own DB
     connection (sqlite3 connections aren't shared across threads); updates
@@ -695,7 +696,19 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor):
             job.update(status="error", error="site_not_found")
             return
 
-        requirements = conn.execute("SELECT * FROM requirements ORDER BY id").fetchall()
+        # Which regulatory frameworks to check against. Previously every check
+        # always ran the full requirement library regardless of relevance --
+        # most of that library only applies in specific contexts (sterile vs.
+        # non-sterile, market, electronic-records use, etc.), so blindly
+        # running all of it produced a report dominated by "Not Applicable"
+        # noise. The user now explicitly picks which regulation(s) apply for
+        # each Check Compliance run (multi-select, asked every time) instead
+        # of the system guessing or defaulting to everything.
+        if requested_sources:
+            placeholders = ",".join("?" for _ in requested_sources)
+            requirements = conn.execute(f"SELECT * FROM requirements WHERE source IN ({placeholders}) ORDER BY id", requested_sources).fetchall()
+        else:
+            requirements = conn.execute("SELECT * FROM requirements ORDER BY id").fetchall()
         sop_rows = conn.execute("""
             SELECT sop.id as sop_id, sop.sop_number, sop.title, sop.sop_category
             FROM sops sop JOIN sop_versions sv ON sv.sop_id = sop.id AND sv.is_current = 1
@@ -851,22 +864,23 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor):
             initiated_at = db.now()
             stored_name = f"compliance_report_site{site_id}_{secrets.token_hex(4)}.docx"
             report_path = os.path.join(GEN_DIR, stored_name)
+            regulations_checked = list(requested_sources) if requested_sources else sorted({r["source"] for r in requirements})
             report_service.generate_compliance_report(
                 report_path, report_sop, dict(site), results,
                 ai_mock_any=any(r.get("ai_mock") for r in results),
                 general_issues=general_issues, general_ai_mock=general_ai_mock, general_offline_note=general_offline_note,
-                initiated_by=actor, initiated_at=initiated_at,
+                initiated_by=actor, initiated_at=initiated_at, regulations_checked=regulations_checked,
             )
             summary_name = f"compliance_summary_site{site_id}_{secrets.token_hex(4)}.docx"
             summary_path = os.path.join(GEN_DIR, summary_name)
             report_service.generate_compliance_summary_report(
                 summary_path, report_sop, dict(site), results,
-                general_issues=general_issues, initiated_by=actor, initiated_at=initiated_at,
+                general_issues=general_issues, initiated_by=actor, initiated_at=initiated_at, regulations_checked=regulations_checked,
             )
             title = f"Compliance Report — {report_sop['sop_number']} — {site['code']}"
             cur = conn.execute(
-                "INSERT INTO reports (report_type, site_id, sop_id, title, filepath, summary_filepath, created_by, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                ("compliance_check", site_id, sops[0]["sop_id"] if len(sops) == 1 else None, title, report_path, summary_path, actor, initiated_at),
+                "INSERT INTO reports (report_type, site_id, sop_id, title, filepath, summary_filepath, created_by, created_at, regulations_json) VALUES (?,?,?,?,?,?,?,?,?)",
+                ("compliance_check", site_id, sops[0]["sop_id"] if len(sops) == 1 else None, title, report_path, summary_path, actor, initiated_at, json.dumps(regulations_checked)),
             )
             conn.commit()
             report_id = cur.lastrowid
@@ -906,17 +920,35 @@ def run_rtm_mapping():
     Accepts an optional "sop_ids" list to restrict the run to specific SOPs at
     the site rather than every SOP uploaded there. If omitted or empty, every
     current SOP at the site is considered.
+
+    Accepts an optional "sources" list (e.g. ["FDA 21 CFR 211", "USP <790>"])
+    to restrict the run to specific regulatory frameworks -- see GET
+    /api/requirements/sources for the available list. If omitted or empty,
+    every requirement in the library is considered (the old behavior).
     """
     data = request.get_json(force=True)
     site_id = data["site_id"]
     requested_sop_ids = data.get("sop_ids") or []
+    requested_sources = data.get("sources") or []
     actor = actor_label()  # must capture here -- actor_label() reads Flask's request-local `g`, unavailable in the worker thread
 
     job_id = secrets.token_hex(8)
     RTM_JOBS[job_id] = {"status": "running", "site_id": site_id, "total": 0, "done": 0, "results": [], "failed": [], "error": None, "report_id": None, "started_at": db.now()}
-    thread = threading.Thread(target=_run_rtm_job, args=(job_id, site_id, requested_sop_ids, actor), daemon=True)
+    thread = threading.Thread(target=_run_rtm_job, args=(job_id, site_id, requested_sop_ids, actor, requested_sources), daemon=True)
     thread.start()
     return jsonify({"job_id": job_id, "status": "running"}), 202
+
+
+@app.route("/api/requirements/sources", methods=["GET"])
+@require_auth()
+def list_requirement_sources():
+    """Distinct regulatory frameworks in the requirement library, with a count
+    of how many requirements each has -- powers the "which regulations apply
+    to this SOP?" picker shown before every Check Compliance run."""
+    conn = db.get_db()
+    rows = conn.execute("SELECT source, COUNT(*) as count FROM requirements GROUP BY source ORDER BY source").fetchall()
+    conn.close()
+    return jsonify(db.rows_to_list(rows))
 
 
 @app.route("/api/rtm/run-mapping/<job_id>", methods=["GET"])

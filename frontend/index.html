@@ -624,6 +624,21 @@ function uploadModal() {
         <button class="btn" id="submitUpload">Upload Package</button>
       </div>
     </div>
+  </div>
+  <div id="regulationsModalBg" class="modal-bg hidden">
+    <div class="modal" style="width:520px;">
+      <h3>Which regulations apply to this SOP?</h3>
+      <p class="muted" style="margin-top:0;">Not every regulatory framework applies to every SOP or site (e.g. EU GMP Annex 1 is sterile-only, USP &lt;790&gt;/&lt;1790&gt; is injectables-only). Pick the framework(s) relevant here — Check Compliance will only evaluate requirements from what you select, and the report will record your selection.</p>
+      <div class="row" style="justify-content:flex-start; gap:8px; margin-bottom:8px;">
+        <button class="btn small secondary" id="regsSelectAll">Select All</button>
+        <button class="btn small secondary" id="regsSelectNone">Select None</button>
+      </div>
+      <div id="regulationsModalBody" class="muted">Loading…</div>
+      <div class="row" style="justify-content:flex-end; margin-top:14px;">
+        <button class="btn secondary" id="cancelRegulationsModal">Cancel</button>
+        <button class="btn" id="confirmRegulationsModal">Run Check Compliance</button>
+      </div>
+    </div>
   </div>`;
 }
 
@@ -672,24 +687,32 @@ async function comparisonView() {
 // ---------------- Reports ----------------
 async function reportsView() {
   const allReports = await api("/reports");
-  const rows = allReports.map(r => `
+  const rows = allReports.map(r => {
+    let regs = "";
+    try {
+      const parsed = r.regulations_json ? JSON.parse(r.regulations_json) : [];
+      regs = Array.isArray(parsed) && parsed.length ? parsed.join(", ") : "";
+    } catch (e) { regs = ""; }
+    return `
     <tr>
       <td>${r.report_type === "compliance_check" ? "Compliance Check" : r.report_type === "comparison" ? "Site Comparison" : r.report_type}</td>
       <td>${r.title}</td>
       <td>${[r.site_code, r.sop_number].filter(Boolean).join(" — ") || "<span class='muted'>multiple / all sites</span>"}</td>
+      <td>${regs || "<span class='muted'>—</span>"}</td>
       <td>${(r.created_at || "").slice(0,16).replace("T", " ")}</td>
       <td>${r.created_by || ""}</td>
       <td>
         <button class="btn small secondary reportDlBtn" data-report="${r.id}" data-kind="detailed" data-title="${(r.title||"").replace(/"/g,'&quot;')}">Download Report</button>
         ${r.summary_filepath ? `<button class="btn small secondary reportDlBtn" data-report="${r.id}" data-kind="summary" data-title="${(r.title||"").replace(/"/g,'&quot;')}">Download Summary</button>` : ""}
       </td>
-    </tr>`).join("") || `<tr><td colspan="6" class="muted">No reports generated yet — run a Check Compliance or Site Comparison first.</td></tr>`;
+    </tr>`;
+  }).join("") || `<tr><td colspan="7" class="muted">No reports generated yet — run a Check Compliance or Site Comparison first.</td></tr>`;
   return `
     <div class="card">
       <h2>Reports</h2>
       <p class="muted">Every Compliance Report (from SOP Repository → Check Compliance) and Comparison Report (from Site Comparison) is listed here, across all plants, and stays downloadable independent of whether the run that produced it is still on screen. Compliance Checks also produce a short Download Summary alongside the full report.</p>
       <p class="muted">Known limitation: without a persistent disk attached, the hosting platform wipes locally stored files on every redeploy/restart. The row below will remain, but downloading it will show a clear message to re-run the check if that's happened.</p>
-      <table><thead><tr><th>Type</th><th>Title</th><th>Scope</th><th>Generated</th><th>By</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>
+      <table><thead><tr><th>Type</th><th>Title</th><th>Scope</th><th>Regulations Checked</th><th>Generated</th><th>By</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
   `;
 }
@@ -871,7 +894,57 @@ async function pollRtmJob(jobId, btn, resetLabel) {
   }
 }
 
+// ---------------- Regulations picker (asked every time Check Compliance runs) ----------------
+let pendingComplianceBtn = null;
+
+async function openRegulationsModal(btn) {
+  pendingComplianceBtn = btn;
+  const body = document.getElementById("regulationsModalBody");
+  body.textContent = "Loading…";
+  document.getElementById("regulationsModalBg").classList.remove("hidden");
+  try {
+    const sources = await api("/requirements/sources");
+    if (!sources.length) { body.innerHTML = `<p class="muted">No requirement library entries found.</p>`; return; }
+    body.innerHTML = sources.map(s => `
+      <label style="display:block; padding:5px 0;">
+        <input type="checkbox" class="regSourceCheck" value="${(s.source||"").replace(/"/g,'&quot;')}" checked />
+        ${s.source} <span class="muted">(${s.count})</span>
+      </label>`).join("");
+  } catch (e) {
+    body.innerHTML = `<p class="muted">Error loading regulations: ${e.message}</p>`;
+  }
+}
+
+function closeRegulationsModal() {
+  document.getElementById("regulationsModalBg").classList.add("hidden");
+  pendingComplianceBtn = null;
+}
+
+function bindRegulationsModalHandlers() {
+  const selectAll = document.getElementById("regsSelectAll");
+  const selectNone = document.getElementById("regsSelectNone");
+  const cancel = document.getElementById("cancelRegulationsModal");
+  const confirm = document.getElementById("confirmRegulationsModal");
+  if (selectAll) selectAll.onclick = () => document.querySelectorAll(".regSourceCheck").forEach(c => c.checked = true);
+  if (selectNone) selectNone.onclick = () => document.querySelectorAll(".regSourceCheck").forEach(c => c.checked = false);
+  if (cancel) cancel.onclick = () => closeRegulationsModal();
+  if (confirm) confirm.onclick = async () => {
+    const btn = pendingComplianceBtn;
+    if (!btn) return;
+    const sources = Array.from(document.querySelectorAll(".regSourceCheck:checked")).map(c => c.value);
+    if (!sources.length) { toast("Select at least one regulation to check against."); return; }
+    closeRegulationsModal();
+    const resetLabel = "Check Compliance";
+    btn.disabled = true; btn.textContent = "Starting AI analysis…";
+    try {
+      const start = await api("/rtm/run-mapping", { method: "POST", body: JSON.stringify({ site_id: state.currentSiteId, sop_ids: [parseInt(btn.dataset.sop, 10)], sources }) });
+      await pollRtmJob(start.job_id, btn, resetLabel);
+    } catch (e) { toast("Error: " + e.message); btn.disabled = false; btn.textContent = resetLabel; }
+  };
+}
+
 function bindTabHandlers() {
+  bindRegulationsModalHandlers();
   const uploadBtn = document.getElementById("uploadSopBtn");
   if (uploadBtn) uploadBtn.onclick = () => { pendingFiles = []; renderFileList(); document.getElementById("uploadModal").classList.remove("hidden"); };
   const cancelUpload = document.getElementById("cancelUpload");
@@ -990,14 +1063,7 @@ function bindTabHandlers() {
   });
 
   document.querySelectorAll(".checkComplianceBtn").forEach(btn => {
-    btn.onclick = async () => {
-      const resetLabel = "Check Compliance";
-      btn.disabled = true; btn.textContent = "Starting AI analysis…";
-      try {
-        const start = await api("/rtm/run-mapping", { method: "POST", body: JSON.stringify({ site_id: state.currentSiteId, sop_ids: [parseInt(btn.dataset.sop, 10)] }) });
-        await pollRtmJob(start.job_id, btn, resetLabel);
-      } catch (e) { toast("Error: " + e.message); btn.disabled = false; btn.textContent = resetLabel; }
-    };
+    btn.onclick = () => openRegulationsModal(btn);
   });
 
   const runCompareBtn = document.getElementById("runCompareBtn");
