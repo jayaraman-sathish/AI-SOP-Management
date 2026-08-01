@@ -233,6 +233,7 @@ def _migrate(conn):
     migrations = [
         "ALTER TABLE reports ADD COLUMN summary_filepath TEXT",
         "ALTER TABLE reports ADD COLUMN regulations_json TEXT",
+        "ALTER TABLE comparison_findings ADD COLUMN report_id INTEGER",
     ]
     for stmt in migrations:
         try:

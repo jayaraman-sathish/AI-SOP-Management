@@ -277,9 +277,11 @@ def list_sops():
     site_id = request.args.get("site_id")
     conn = db.get_db()
     q = """
-        SELECT s.*, sv.id as current_version_id, sv.version_label, sv.filename, sv.uploaded_at,
+        SELECT s.*, sites.code as site_code, sites.name as site_name,
+               sv.id as current_version_id, sv.version_label, sv.filename, sv.uploaded_at,
                (SELECT COUNT(*) FROM sop_attachments sa WHERE sa.sop_version_id = sv.id) as attachment_count
         FROM sops s
+        JOIN sites ON sites.id = s.site_id
         LEFT JOIN sop_versions sv ON sv.sop_id = s.id AND sv.is_current = 1
     """
     params = []
@@ -884,10 +886,19 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor, requested_sources=No
             )
             conn.commit()
             report_id = cur.lastrowid
+            # Distinct, explicit audit entry so "was a report generated, and when"
+            # is answerable from the Audit Trail tab without having to infer it
+            # from the Reports tab or guess whether generation silently failed.
+            db.log_audit(actor, "report_generated", "report", report_id, {
+                "title": title, "kind": "compliance_check", "regulations_checked": regulations_checked,
+                "generated_at": initiated_at,
+            })
         except Exception as e:
             db.log_error("compliance_report_generation", f"{type(e).__name__}: {e}", traceback_text=traceback.format_exc(), context={"site_id": site_id})
+            db.log_audit(actor, "report_generation_failed", "site", site_id, {"error": f"{type(e).__name__}: {e}"})
 
-        job.update(status="done", results=results, failed=failed, report_id=report_id, general_issues=general_issues)
+        job.update(status="done", results=results, failed=failed, report_id=report_id, general_issues=general_issues,
+                   report_generation_failed=(report_id is None))
     except Exception as e:
         job.update(status="error", error=str(e))
         db.log_error(
@@ -965,6 +976,8 @@ def rtm_job_status(job_id):
         if job["failed"]:
             response["failed"] = job["failed"]
             response["warning"] = f"{len(job['failed'])} of {job['total']} requirement(s) could not be assessed and were skipped -- see 'failed' for details. The rest completed normally."
+        if job.get("report_generation_failed"):
+            response["report_warning"] = "The compliance assessment completed, but generating the downloadable report document FAILED -- see the Error Log tab (Admin) for the underlying error. No row was added to the Reports tab for this run."
     elif job["status"] == "error":
         response["error"] = job["error"]
     return jsonify(response)
@@ -1033,40 +1046,61 @@ def run_comparison():
     label = categories[0] if len(categories) == 1 else (", ".join(categories) if categories else "Selected SOPs")
 
     result = ai_service.compare_sops_across_sites(label, site_sops)
-    for finding in result["findings"]:
-        conn.execute(
-            "INSERT INTO comparison_findings (sop_category, process_step, site_values_json, classification, note, ai_mock, created_at) VALUES (?,?,?,?,?,?,?)",
-            (label, finding.get("process_step", ""), __import__("json").dumps(finding.get("site_values", {})),
-             finding.get("classification", "Best-Practice Divergence"), finding.get("note", ""), int(bool(result["ai_mock"])), db.now()),
-        )
 
+    # Generate the downloadable report FIRST so every finding row below can be
+    # tagged with the report_id it belongs to (see comparison_findings.report_id
+    # migration). Previously findings were inserted un-scoped, so GET
+    # /api/comparison returned every finding from every comparison ever run,
+    # all mixed together with no way to tell which run produced which row --
+    # the on-screen results table looked like stale/wrong data after every
+    # new comparison.
     report_id = None
+    title = f"Comparison Report — {', '.join(r['sop_number'] for r in rows)}"
     try:
         sops_compared = [{"site_code": r["site_code"], "site_name": r["site_name"], "sop_number": r["sop_number"], "title": r["title"]} for r in rows]
         stored_name = f"comparison_report_{secrets.token_hex(4)}.docx"
         report_path = os.path.join(GEN_DIR, stored_name)
         report_service.generate_comparison_report(report_path, sops_compared, result["findings"], ai_mock=result.get("ai_mock", False))
-        title = f"Comparison Report — {', '.join(r['sop_number'] for r in rows)}"
         cur = conn.execute(
             "INSERT INTO reports (report_type, site_id, sop_id, title, filepath, created_by, created_at) VALUES (?,?,?,?,?,?,?)",
             ("comparison", None, None, title, report_path, actor_label(), db.now()),
         )
         report_id = cur.lastrowid
+        db.log_audit(actor_label(), "report_generated", "report", report_id, {"title": title, "kind": "comparison"})
     except Exception as e:
         db.log_error("comparison_report_generation", f"{type(e).__name__}: {e}", traceback_text=traceback.format_exc(), context={"sop_ids": sop_ids})
+        db.log_audit(actor_label(), "report_generation_failed", "sop_ids", None, {"sop_ids": sop_ids, "error": f"{type(e).__name__}: {e}"})
+
+    for finding in result["findings"]:
+        conn.execute(
+            "INSERT INTO comparison_findings (sop_category, process_step, site_values_json, classification, note, ai_mock, created_at, report_id) VALUES (?,?,?,?,?,?,?,?)",
+            (label, finding.get("process_step", ""), json.dumps(finding.get("site_values", {})),
+             finding.get("classification", "Best-Practice Divergence"), finding.get("note", ""), int(bool(result["ai_mock"])), db.now(), report_id),
+        )
 
     conn.commit()
     conn.close()
     db.log_audit(actor_label(), "run_comparison", "sop_ids", None, {"sop_ids": sop_ids, "findings": len(result["findings"])})
     result["report_id"] = report_id
+    result["title"] = title
+    if report_id is None:
+        result["report_warning"] = "The comparison completed, but generating the downloadable report document FAILED -- see the Error Log tab (Admin) for the underlying error. No row was added to the Reports tab for this run."
     return jsonify(result)
 
 
 @app.route("/api/comparison", methods=["GET"])
 @require_auth()
 def list_comparison():
+    """Accepts an optional ?report_id= to scope to one comparison run's
+    findings -- without it, this previously returned every finding from every
+    comparison ever run, all mixed together with no way to tell which run
+    produced which row. The frontend now always passes report_id after a run."""
+    report_id = request.args.get("report_id")
     conn = db.get_db()
-    rows = conn.execute("SELECT * FROM comparison_findings ORDER BY id DESC").fetchall()
+    if report_id:
+        rows = conn.execute("SELECT * FROM comparison_findings WHERE report_id=? ORDER BY id", (report_id,)).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM comparison_findings ORDER BY id DESC").fetchall()
     conn.close()
     return jsonify(db.rows_to_list(rows))
 

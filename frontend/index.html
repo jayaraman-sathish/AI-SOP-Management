@@ -78,7 +78,7 @@
 
 <script>
 const API = "/api"; // Flask serves this frontend and the API from the same origin.
-let state = { token: localStorage_token(), user: null, tab: "dashboard", sites: [], currentSiteId: null };
+let state = { token: localStorage_token(), user: null, tab: "dashboard", sites: [], currentSiteId: null, lastComparisonReportId: null, lastComparisonTitle: null };
 
 function localStorage_token() { try { return sessionStorage.getItem("sop_token"); } catch(e) { return null; } }
 function setToken(t) { state.token = t; try { sessionStorage.setItem("sop_token", t || ""); } catch(e) {} }
@@ -644,7 +644,16 @@ function uploadModal() {
 
 // ---------------- Comparison ----------------
 async function comparisonView() {
-  const findings = await api("/comparison");
+  // Results are scoped to the specific comparison run just triggered (by
+  // report_id) -- previously this always loaded EVERY finding from EVERY
+  // comparison ever run, all mixed together with no way to tell which run
+  // produced which row, so the table looked like stale/wrong leftover data.
+  // Until a comparison has been run this session, show nothing here rather
+  // than that unscoped historical dump.
+  let findings = [];
+  if (state.lastComparisonReportId) {
+    try { findings = await api("/comparison?report_id=" + state.lastComparisonReportId); } catch (e) { findings = []; }
+  }
   const rows = findings.map(f => {
     const values = JSON.parse(f.site_values_json || "{}");
     const valStr = Object.entries(values).map(([k, v]) => `<b>${k}</b>: ${v}`).join("<br/>");
@@ -655,15 +664,19 @@ async function comparisonView() {
       <td><span class="badge ${f.classification.includes("Compliance") ? "NotCovered" : f.classification.includes("Best") ? "Partially" : "Covered"}">${f.classification}</span></td>
       <td>${f.note || ""}</td>
     </tr>`;
-  }).join("") || `<tr><td colspan="5" class="muted">No comparisons run yet.</td></tr>`;
+  }).join("") || `<tr><td colspan="5" class="muted">${state.lastComparisonReportId ? "This comparison found no differences to report." : "No comparison run yet this session — select SOPs below and click Compare."}</td></tr>`;
 
   const allSops = await api("/sops?site_id=");
   const bySite = {};
-  allSops.forEach(s => { (bySite[s.site_code || "—"] = bySite[s.site_code || "—"] || []).push(s); });
-  const checklist = Object.keys(bySite).sort().map(code => `
+  allSops.forEach(s => {
+    const key = s.site_code || "Unknown Site";
+    const label = s.site_code ? `${s.site_code} — ${s.site_name || ""}` : "Unknown Site";
+    (bySite[key] = bySite[key] || { label, sops: [] }).sops.push(s);
+  });
+  const checklist = Object.keys(bySite).sort().map(key => `
     <div style="margin-bottom:8px;">
-      <b style="font-size:12px;">${code}</b><br/>
-      ${bySite[code].map(s => `
+      <b style="font-size:12px;">${bySite[key].label}</b><br/>
+      ${bySite[key].sops.map(s => `
         <label style="display:inline-flex; align-items:center; gap:4px; margin:2px 10px 2px 0; font-size:13px;">
           <input type="checkbox" class="compareSopCheck" value="${s.id}" /> ${s.sop_number} <span class="muted">(${s.sop_category || "no category"})</span>
         </label>`).join("")}
@@ -672,13 +685,14 @@ async function comparisonView() {
   return `
     <div class="card">
       <h2>Site-to-Site Comparison</h2>
-      <p class="muted">Browse every SOP uploaded across all plants below and explicitly check the specific SOPs you want compared (select at least 2) — this no longer auto-pulls every SOP sharing a category. On submit, the system compares only what you selected, lists concrete differences, and generates a downloadable Comparison Report (logged in the Reports tab).</p>
+      <p class="muted">SOPs below are grouped by plant/site — check the specific SOPs you want compared (select at least 2, from any plant(s)) — this no longer auto-pulls every SOP sharing a category. On submit, the system compares only what you selected, lists concrete differences, and generates a downloadable Comparison Report (logged in the Reports tab).</p>
       ${state.aiLive ? "" : `<div class="ai-banner">⚠ Running in offline heuristic mode — no ANTHROPIC_API_KEY configured on the server. Comparison findings below are placeholder results, clearly flagged "AI mock".</div>`}
       <div style="margin-bottom:10px;">${checklist}</div>
       <div class="row">
         <button class="btn" id="runCompareBtn">Compare Selected SOPs</button>
         <span class="muted">Select 2 or more SOPs above, from any plant(s), to compare.</span>
       </div>
+      <h3 style="margin-top:20px;">${state.lastComparisonReportId ? `Results — <span class="badge">RPT-${state.lastComparisonReportId}</span> ${escHtml(state.lastComparisonTitle || "")}` : "Results"}</h3>
       <table><thead><tr><th>Category</th><th>Process Step</th><th>Site Values</th><th>Classification</th><th>Note</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
   `;
@@ -695,6 +709,7 @@ async function reportsView() {
     } catch (e) { regs = ""; }
     return `
     <tr>
+      <td><span class="badge">RPT-${r.id}</span></td>
       <td>${r.report_type === "compliance_check" ? "Compliance Check" : r.report_type === "comparison" ? "Site Comparison" : r.report_type}</td>
       <td>${r.title}</td>
       <td>${[r.site_code, r.sop_number].filter(Boolean).join(" — ") || "<span class='muted'>multiple / all sites</span>"}</td>
@@ -706,13 +721,13 @@ async function reportsView() {
         ${r.summary_filepath ? `<button class="btn small secondary reportDlBtn" data-report="${r.id}" data-kind="summary" data-title="${(r.title||"").replace(/"/g,'&quot;')}">Download Summary</button>` : ""}
       </td>
     </tr>`;
-  }).join("") || `<tr><td colspan="7" class="muted">No reports generated yet — run a Check Compliance or Site Comparison first.</td></tr>`;
+  }).join("") || `<tr><td colspan="8" class="muted">No reports generated yet — run a Check Compliance or Site Comparison first.</td></tr>`;
   return `
     <div class="card">
       <h2>Reports</h2>
-      <p class="muted">Every Compliance Report (from SOP Repository → Check Compliance) and Comparison Report (from Site Comparison) is listed here, across all plants, and stays downloadable independent of whether the run that produced it is still on screen. Compliance Checks also produce a short Download Summary alongside the full report.</p>
+      <p class="muted">Every Compliance Report (from SOP Repository → Check Compliance) and Comparison Report (from Site Comparison) is listed here, across all plants, and stays downloadable independent of whether the run that produced it is still on screen. Compliance Checks also produce a short Download Summary alongside the full report. Each report has a permanent <b>Report ID</b> (RPT-N) you can use to reference it -- e.g. in an email or a QA record -- and every generation (success or failure) is logged in the Audit Trail tab with that same ID.</p>
       <p class="muted">Known limitation: without a persistent disk attached, the hosting platform wipes locally stored files on every redeploy/restart. The row below will remain, but downloading it will show a clear message to re-run the check if that's happened.</p>
-      <table><thead><tr><th>Type</th><th>Title</th><th>Scope</th><th>Regulations Checked</th><th>Generated</th><th>By</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>
+      <table><thead><tr><th>Report ID</th><th>Type</th><th>Title</th><th>Scope</th><th>Regulations Checked</th><th>Generated</th><th>By</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
   `;
 }
@@ -881,7 +896,8 @@ async function pollRtmJob(jobId, btn, resetLabel) {
       btn.textContent = `Checking compliance…${progress}`;
     } else if (status.status === "done") {
       if (status.warning) toast(status.warning);
-      if (status.report_id) toast("Compliance check complete — report ready in the Reports tab.");
+      if (status.report_id) toast(`Compliance check complete — report RPT-${status.report_id} ready in the Reports tab.`);
+      else if (status.report_warning) toast("⚠ " + status.report_warning);
       else toast("Compliance check complete.");
       btn.disabled = false; btn.textContent = resetLabel;
       renderTab();
@@ -1073,7 +1089,11 @@ function bindTabHandlers() {
     runCompareBtn.disabled = true; runCompareBtn.textContent = "Comparing…";
     try {
       const res = await api("/comparison/run", { method: "POST", body: JSON.stringify({ sop_ids }) });
-      toast(res.report_id ? "Comparison complete — report ready in the Reports tab." : "Comparison complete.");
+      state.lastComparisonReportId = res.report_id || null;
+      state.lastComparisonTitle = res.title || null;
+      if (res.report_id) toast(`Comparison complete — report RPT-${res.report_id} ready in the Reports tab.`);
+      else if (res.report_warning) toast("⚠ " + res.report_warning);
+      else toast("Comparison complete.");
       renderTab();
     } catch (e) { toast("Error: " + e.message); }
     runCompareBtn.disabled = false; runCompareBtn.textContent = "Compare Selected SOPs";
