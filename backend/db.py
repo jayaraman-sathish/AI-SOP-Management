@@ -216,7 +216,29 @@ def init_db():
     conn = get_db()
     conn.executescript(SCHEMA)
     conn.commit()
+    _migrate(conn)
     conn.close()
+
+
+def _migrate(conn):
+    """Additive, best-effort schema migrations for columns added after a table's
+    original CREATE TABLE IF NOT EXISTS. That statement only creates a table if
+    it's entirely missing -- it does NOT add new columns to a table that
+    already exists, which now matters: with the persistent disk in place, a
+    real deployment's database survives across deploys, so a brand-new column
+    needs an explicit ALTER TABLE to reach it. Each ALTER is wrapped
+    individually so one already-applied migration doesn't block the rest, and
+    a fresh/dev database (where the column already came from SCHEMA above)
+    just no-ops here."""
+    migrations = [
+        "ALTER TABLE reports ADD COLUMN summary_filepath TEXT",
+    ]
+    for stmt in migrations:
+        try:
+            conn.execute(stmt)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists -- already applied
 
 
 def log_audit(actor, action, entity_type, entity_id=None, details=None):

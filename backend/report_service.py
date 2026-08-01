@@ -53,19 +53,29 @@ def _title_block(doc, title, subtitle):
     doc.add_paragraph()
 
 
-def generate_compliance_report(output_path, sop, site, rtm_results, ai_mock_any=False):
+def generate_compliance_report(output_path, sop, site, rtm_results, ai_mock_any=False,
+                                general_issues=None, general_ai_mock=False, general_offline_note=None,
+                                initiated_by=None, initiated_at=None):
     """
     sop: dict with sop_number, title, sop_category
     site: dict with code, name
     rtm_results: list of {req_code, source, clause, requirement_text, coverage_status, rationale, sop_id}
         (the same shape returned by the RTM background job's "results" list)
+    general_issues: list of {issue_type, location, current_text, proposed_correction, why_needed} --
+        writing-quality/completeness findings, independent of any specific regulatory requirement.
     """
+    general_issues = general_issues or []
     doc = Document()
     _title_block(
         doc,
         "SOP Compliance Report",
         f"{sop['sop_number']} — {sop['title']}  |  {site['code']} — {site['name']}",
     )
+    if initiated_by or initiated_at:
+        meta = doc.add_paragraph()
+        mr = meta.add_run(f"Initiated by {initiated_by or 'unknown'} on {initiated_at or 'unknown'}")
+        mr.font.size = Pt(9)
+        mr.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
 
     if ai_mock_any:
         warn = doc.add_paragraph()
@@ -125,6 +135,119 @@ def generate_compliance_report(output_path, sop, site, rtm_results, ai_mock_any=
         nr.font.size = Pt(9)
         nr.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
         _result_table(doc, missing, "", compact=True)
+
+    doc.add_paragraph()
+    h4 = doc.add_paragraph()
+    h4r = h4.add_run("General — Writing Quality & Completeness")
+    h4r.bold = True
+    h4r.font.size = Pt(14)
+    h4r.font.color.rgb = NAVY
+    note4 = doc.add_paragraph()
+    n4r = note4.add_run(
+        "Grammar, spelling, sentence-formation, and missing-form/template issues found in this SOP's own "
+        "text -- independent of regulatory compliance, which is covered in the sections above."
+    )
+    n4r.italic = True
+    n4r.font.size = Pt(9)
+    n4r.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+    if general_ai_mock:
+        gwarn = doc.add_paragraph()
+        gwr = gwarn.add_run(f"⚠ {general_offline_note or 'General review requires a live Claude API key.'}")
+        gwr.bold = True
+        gwr.font.size = Pt(9)
+        gwr.font.color.rgb = RGBColor(0xC0, 0x00, 0x00)
+    _general_issues_table(doc, general_issues, "No writing-quality or completeness issues were found.")
+
+    doc.save(output_path)
+    return output_path
+
+
+def _general_issues_table(doc, issues, empty_note):
+    if not issues:
+        p = doc.add_paragraph(empty_note)
+        if p.runs:
+            p.runs[0].italic = True
+        return
+    cols = ["Issue Type", "Location", "Current Text", "Proposed Correction", "Why Needed"]
+    table = doc.add_table(rows=1 + len(issues), cols=len(cols))
+    table.style = "Table Grid"
+    hdr = table.rows[0]
+    for i, text in enumerate(cols):
+        _set_cell_text(hdr.cells[i], text, bold=True, color=RGBColor(0xFF, 0xFF, 0xFF), size=9)
+        _shade_cell(hdr.cells[i], "1F3864")
+    for ri, issue in enumerate(issues, start=1):
+        row = table.rows[ri]
+        _set_cell_text(row.cells[0], issue.get("issue_type", ""), bold=True, size=9)
+        _set_cell_text(row.cells[1], issue.get("location", ""), size=9)
+        _set_cell_text(row.cells[2], (issue.get("current_text") or "")[:300], size=9)
+        _set_cell_text(row.cells[3], (issue.get("proposed_correction") or "")[:300], size=9)
+        _set_cell_text(row.cells[4], (issue.get("why_needed") or "")[:300], size=9)
+
+
+def generate_compliance_summary_report(output_path, sop, site, rtm_results, general_issues=None,
+                                        initiated_by=None, initiated_at=None):
+    """
+    A short, one-page companion to the full Compliance Report -- who ran it,
+    when, and the headline numbers, without the detailed per-requirement
+    tables. Mirrors the existing Redline + Change Summary pairing so a
+    reviewer who just wants the top line doesn't have to open the full report.
+    """
+    general_issues = general_issues or []
+    doc = Document()
+    _title_block(
+        doc,
+        "SOP Compliance Summary",
+        f"{sop['sop_number']} — {sop['title']}  |  {site['code']} — {site['name']}",
+    )
+    meta = doc.add_paragraph()
+    mr = meta.add_run(f"Initiated by {initiated_by or 'unknown'} on {initiated_at or 'unknown'}")
+    mr.font.size = Pt(9)
+    mr.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+    doc.add_paragraph()
+
+    counts = {}
+    for r in rtm_results:
+        counts[r["coverage_status"]] = counts.get(r["coverage_status"], 0) + 1
+    total = len(rtm_results)
+    checked = total - counts.get("SOP Missing", 0)
+
+    cols = ["Metric", "Count"]
+    stat_rows = [
+        ("Regulatory requirements evaluated", total),
+        ("Within this SOP's actual scope", checked),
+        ("Compliant", counts.get("Covered", 0)),
+        ("Partially Compliant", counts.get("Partially Covered", 0)),
+        ("Non-Compliant", counts.get("Not Covered", 0)),
+        ("Not Applicable to this SOP", counts.get("SOP Missing", 0)),
+        ("General writing/completeness issues", len(general_issues)),
+    ]
+    table = doc.add_table(rows=1 + len(stat_rows), cols=len(cols))
+    table.style = "Table Grid"
+    hdr = table.rows[0]
+    for i, text in enumerate(cols):
+        _set_cell_text(hdr.cells[i], text, bold=True, color=RGBColor(0xFF, 0xFF, 0xFF))
+        _shade_cell(hdr.cells[i], "1F3864")
+    for ri, (label, value) in enumerate(stat_rows, start=1):
+        row = table.rows[ri]
+        _set_cell_text(row.cells[0], label, size=10)
+        _set_cell_text(row.cells[1], value, bold=True, size=10)
+
+    non_compliant = [r for r in rtm_results if r["coverage_status"] in ("Partially Covered", "Not Covered")]
+    if non_compliant:
+        doc.add_paragraph()
+        h = doc.add_paragraph()
+        hr = h.add_run("Top Findings Needing Attention")
+        hr.bold = True
+        hr.font.size = Pt(13)
+        hr.font.color.rgb = NAVY
+        for r in non_compliant[:5]:
+            p = doc.add_paragraph(style="List Bullet")
+            run = p.add_run(f"{r.get('req_code','')} ({r.get('source','')} {r.get('clause','')}) — {r.get('coverage_status','')}")
+            run.bold = True
+            run.font.size = Pt(10)
+        if len(non_compliant) > 5:
+            more = doc.add_paragraph()
+            more.add_run(f"...and {len(non_compliant) - 5} more. See the full Compliance Report for details.").italic = True
 
     doc.save(output_path)
     return output_path

@@ -824,30 +824,56 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor):
 
         db.log_audit(actor, "run_rtm_mapping", "site", site_id, {"requirements_assessed": len(results), "failed": len(failed)})
 
-        # Generate the downloadable Compliance Report and log it so it shows up
-        # in the Reports tab -- the on-screen results only last as long as this
-        # job/page does, the report persists (until the next Render redeploy
-        # wipes local files, same limitation as everything else generated here).
+        # General writing-quality/completeness review -- independent of the
+        # regulatory RTM assessment above. Only meaningful for a single,
+        # specific SOP (the normal case via the per-SOP "Check Compliance"
+        # button); skipped for a full-site or multi-SOP run where there's no
+        # one document's prose to review.
+        general_issues, general_ai_mock, general_offline_note = [], False, None
+        if len(sops) == 1:
+            try:
+                general_result = ai_service.review_sop_quality(sops[0]["title"], sops[0]["full_text"])
+                general_issues = general_result["issues"]
+                general_ai_mock = general_result["ai_mock"]
+                general_offline_note = general_result.get("offline_note")
+            except Exception as e:
+                db.log_error("general_sop_quality_review", f"{type(e).__name__}: {e}", traceback_text=traceback.format_exc(), context={"site_id": site_id})
+
+        # Generate the downloadable Compliance Report (+ a short Summary
+        # Report) and log them so they show up in the Reports tab -- the
+        # on-screen results only last as long as this job/page does, the
+        # reports persist (until the next Render redeploy wipes local files
+        # if no persistent disk is attached, same limitation as everything
+        # else generated here).
         report_id = None
         try:
             report_sop = sops[0] if len(sops) == 1 else {"sop_number": "Multiple SOPs", "title": f"{len(sops)} SOPs checked", "sop_category": ""}
+            initiated_at = db.now()
             stored_name = f"compliance_report_site{site_id}_{secrets.token_hex(4)}.docx"
             report_path = os.path.join(GEN_DIR, stored_name)
             report_service.generate_compliance_report(
                 report_path, report_sop, dict(site), results,
                 ai_mock_any=any(r.get("ai_mock") for r in results),
+                general_issues=general_issues, general_ai_mock=general_ai_mock, general_offline_note=general_offline_note,
+                initiated_by=actor, initiated_at=initiated_at,
+            )
+            summary_name = f"compliance_summary_site{site_id}_{secrets.token_hex(4)}.docx"
+            summary_path = os.path.join(GEN_DIR, summary_name)
+            report_service.generate_compliance_summary_report(
+                summary_path, report_sop, dict(site), results,
+                general_issues=general_issues, initiated_by=actor, initiated_at=initiated_at,
             )
             title = f"Compliance Report — {report_sop['sop_number']} — {site['code']}"
             cur = conn.execute(
-                "INSERT INTO reports (report_type, site_id, sop_id, title, filepath, created_by, created_at) VALUES (?,?,?,?,?,?,?)",
-                ("compliance_check", site_id, sops[0]["sop_id"] if len(sops) == 1 else None, title, report_path, actor, db.now()),
+                "INSERT INTO reports (report_type, site_id, sop_id, title, filepath, summary_filepath, created_by, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                ("compliance_check", site_id, sops[0]["sop_id"] if len(sops) == 1 else None, title, report_path, summary_path, actor, initiated_at),
             )
             conn.commit()
             report_id = cur.lastrowid
         except Exception as e:
             db.log_error("compliance_report_generation", f"{type(e).__name__}: {e}", traceback_text=traceback.format_exc(), context={"site_id": site_id})
 
-        job.update(status="done", results=results, failed=failed, report_id=report_id)
+        job.update(status="done", results=results, failed=failed, report_id=report_id, general_issues=general_issues)
     except Exception as e:
         job.update(status="error", error=str(e))
         db.log_error(
@@ -903,6 +929,7 @@ def rtm_job_status(job_id):
     if job["status"] == "done":
         response["results"] = job["results"]
         response["report_id"] = job.get("report_id")
+        response["general_issues_count"] = len(job.get("general_issues") or [])
         if job["failed"]:
             response["failed"] = job["failed"]
             response["warning"] = f"{len(job['failed'])} of {job['total']} requirement(s) could not be assessed and were skipped -- see 'failed' for details. The rest completed normally."
@@ -1227,22 +1254,25 @@ def list_reports():
 @app.route("/api/reports/<int:report_id>/download", methods=["GET"])
 @require_auth()
 def download_report(report_id):
+    kind = request.args.get("kind", "detailed")  # "detailed" | "summary"
     conn = db.get_db()
     rep = conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
     conn.close()
     if not rep:
         return jsonify({"error": "not_found"}), 404
-    if not rep["filepath"] or not os.path.exists(rep["filepath"]):
+    filepath = rep["summary_filepath"] if kind == "summary" and rep["summary_filepath"] else rep["filepath"]
+    if not filepath or not os.path.exists(filepath):
         return jsonify({
             "error": "file_not_found",
             "message": (
-                "This report file no longer exists on the server. Render's free tier wipes locally "
-                "stored files every time the app redeploys. Re-run the compliance check or comparison "
-                "to regenerate it."
+                "This report file no longer exists on the server. If no persistent disk is attached, "
+                "Render wipes locally stored files on every redeploy/restart. Re-run the compliance "
+                "check or comparison to regenerate it."
             ),
         }), 404
     safe_title = re.sub(r"[^A-Za-z0-9_.-]", "_", rep["title"])
-    return send_file(rep["filepath"], as_attachment=True, download_name=f"{safe_title}.docx")
+    suffix = "_Summary" if kind == "summary" else ""
+    return send_file(filepath, as_attachment=True, download_name=f"{safe_title}{suffix}.docx")
 
 
 @app.route("/api/revisions/<int:revision_id>/decision", methods=["POST"])

@@ -426,3 +426,70 @@ Respond with JSON exactly in this shape:
                 "fallback. Configure ANTHROPIC_API_KEY to use this feature."
             ),
         }
+
+
+# ---------------------------------------------------------------------------
+# Task 5: General review -- writing quality and completeness, independent of
+# any specific regulatory requirement
+# ---------------------------------------------------------------------------
+def review_sop_quality(sop_title, sop_text):
+    """
+    Reviews an SOP for issues that aren't tied to any single regulatory
+    requirement: grammar, spelling, and sentence-formation problems, plus
+    whether the document references or clearly needs supporting forms/
+    templates/annexures that aren't present. This is deliberately separate
+    from the regulatory RTM assessment -- a sentence can be grammatically
+    broken or a referenced form missing regardless of whether the SOP is
+    otherwise regulatorily compliant, and conflating the two would bury
+    genuine compliance gaps under copy-editing notes (or vice versa).
+
+    returns: {"issues": [...], "ai_mock": bool, "offline_note": str|None}
+    Each issue: {issue_type, location, current_text, proposed_correction, why_needed}
+    issue_type is one of "Grammar", "Spelling", "Sentence Formation", "Missing Form/Template".
+    """
+    system_prompt = (
+        "You are a pharmaceutical SOP editor doing a writing-quality and completeness review -- NOT a "
+        "regulatory compliance review. Read the SOP text and identify concrete issues in two categories only: "
+        "(1) grammar, spelling, or sentence-formation problems that make an instruction unclear or incorrect, "
+        "and (2) forms, templates, or annexures the SOP's own text references or clearly implies but that "
+        "are not present in what you were given (e.g. 'record results on Format XYZ' with no such format "
+        "included). Do not comment on regulatory compliance -- that is handled separately. Only flag real, "
+        "specific issues with an exact quote from the text; do not invent generic style preferences. If the "
+        "SOP is clean, return an empty list. Respond with strict JSON only, no prose outside the JSON."
+    )
+    user_prompt = f"""SOP: {sop_title}
+SOP text (excerpt):
+{sop_text[:8000]}
+
+Respond with JSON exactly in this shape:
+{{
+  "issues": [
+    {{
+      "issue_type": "Grammar" | "Spelling" | "Sentence Formation" | "Missing Form/Template",
+      "location": "<short pointer, e.g. 'Section 4.2, second paragraph'>",
+      "current_text": "<short exact quote of the problematic text, or the SOP's reference to the missing form>",
+      "proposed_correction": "<the corrected text, or what form/template should be added>",
+      "why_needed": "<1 sentence: why this needs fixing>"
+    }}
+  ]
+}}"""
+    try:
+        raw = _call_claude(system_prompt, user_prompt, max_tokens=3000)
+        parsed = _extract_json_object(raw)
+        issues = parsed.get("issues")
+        if not isinstance(issues, list):
+            raise AIError("missing_issues_list_in_response")
+        return {"issues": issues, "ai_mock": False, "offline_note": None}
+    except AIError as e:
+        # Like discovery, there is no sensible offline substitute for judging
+        # writing quality or spotting an implied-but-missing form -- a
+        # keyword heuristic can't do either reliably. Be explicit rather than
+        # faking a result.
+        return {
+            "issues": [],
+            "ai_mock": True,
+            "offline_note": (
+                f"General writing/completeness review requires a live Claude API key ({e}) -- there is no "
+                "offline heuristic for this. Configure ANTHROPIC_API_KEY to use this feature."
+            ),
+        }

@@ -402,7 +402,7 @@ async function sopsView() {
       </div>
       ${state.aiLive ? "" : `<div class="ai-banner">⚠ Running in offline heuristic mode — no ANTHROPIC_API_KEY configured on the server. Compliance assessments below are placeholder keyword-overlap results, clearly flagged "AI mock". Set the key to get real semantic analysis.</div>`}
       <p class="muted">No SOP Category set? Site Comparison and AI matching both need it — click <b>Edit</b> on a row to set or fix it without re-uploading.</p>
-      <p class="muted"><b>Check Compliance</b> assesses every requirement in the Requirement Library directly against this SOP's actual content and generates a downloadable Word Compliance Report (Compliant / Non-Compliant / Not Applicable to this SOP), logged in the Reports tab. A requirement this SOP simply doesn't cover the subject matter of is marked "Not Applicable" — not a finding against this document.</p>
+      <p class="muted"><b>Check Compliance</b> assesses every requirement in the Requirement Library directly against this SOP's actual content, plus a separate General review of the SOP's own writing (grammar, spelling, sentence formation) and completeness (missing forms/templates it references). Generates a downloadable Word Compliance Report (Compliant / Non-Compliant / Not Applicable / General) plus a short Summary Report, both logged in the Reports tab. A requirement this SOP simply doesn't cover the subject matter of is marked "Not Applicable" — not a finding against this document.</p>
       <p class="muted"><b>Discover Additional Requirements</b> reads this SOP and suggests regulatory topics (USP, PDA, EU/WHO/FDA clauses) that aren't in the requirement library yet but this SOP's subject matter would typically need to address. These are unverified AI suggestions, not confirmed findings — review them in the Suggested Requirements tab before they count toward a Compliance Check.</p>
       <table><thead><tr><th>SOP Number</th><th>Title</th><th>Category</th><th>Version</th><th>Attachments</th><th>Uploaded</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
@@ -679,13 +679,16 @@ async function reportsView() {
       <td>${[r.site_code, r.sop_number].filter(Boolean).join(" — ") || "<span class='muted'>multiple / all sites</span>"}</td>
       <td>${(r.created_at || "").slice(0,16).replace("T", " ")}</td>
       <td>${r.created_by || ""}</td>
-      <td><button class="btn small secondary reportDlBtn" data-report="${r.id}" data-title="${(r.title||"").replace(/"/g,'&quot;')}">Download</button></td>
+      <td>
+        <button class="btn small secondary reportDlBtn" data-report="${r.id}" data-kind="detailed" data-title="${(r.title||"").replace(/"/g,'&quot;')}">Download Report</button>
+        ${r.summary_filepath ? `<button class="btn small secondary reportDlBtn" data-report="${r.id}" data-kind="summary" data-title="${(r.title||"").replace(/"/g,'&quot;')}">Download Summary</button>` : ""}
+      </td>
     </tr>`).join("") || `<tr><td colspan="6" class="muted">No reports generated yet — run a Check Compliance or Site Comparison first.</td></tr>`;
   return `
     <div class="card">
       <h2>Reports</h2>
-      <p class="muted">Every Compliance Report (from SOP Repository → Check Compliance) and Comparison Report (from Site Comparison) is listed here, across all plants, and stays downloadable independent of whether the run that produced it is still on screen.</p>
-      <p class="muted">Known limitation: Render's free tier has no persistent disk — a generated report file is wiped on the next redeploy. The row below will remain, but downloading it will show a clear message to re-run the check if that's happened.</p>
+      <p class="muted">Every Compliance Report (from SOP Repository → Check Compliance) and Comparison Report (from Site Comparison) is listed here, across all plants, and stays downloadable independent of whether the run that produced it is still on screen. Compliance Checks also produce a short Download Summary alongside the full report.</p>
+      <p class="muted">Known limitation: without a persistent disk attached, the hosting platform wipes locally stored files on every redeploy/restart. The row below will remain, but downloading it will show a clear message to re-run the check if that's happened.</p>
       <table><thead><tr><th>Type</th><th>Title</th><th>Scope</th><th>Generated</th><th>By</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
   `;
@@ -1013,10 +1016,11 @@ function bindTabHandlers() {
   document.querySelectorAll(".reportDlBtn").forEach(btn => {
     btn.onclick = async () => {
       try {
-        const blob = await api(`/reports/${btn.dataset.report}/download`);
+        const kind = btn.dataset.kind || "detailed";
+        const blob = await api(`/reports/${btn.dataset.report}/download?kind=${kind}`);
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
-        a.href = url; a.download = `${btn.dataset.title || "report"}.docx`;
+        a.href = url; a.download = `${btn.dataset.title || "report"}${kind === "summary" ? "_Summary" : ""}.docx`;
         document.body.appendChild(a); a.click(); a.remove();
       } catch (e) { toast("Error: " + (e.message || "could not download this report")); }
     };
