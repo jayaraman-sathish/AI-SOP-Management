@@ -125,8 +125,17 @@ def assess_requirement_coverage(requirement, sop_excerpts):
         "some may have nothing to do with this requirement's subject matter, and you must judge that from "
         "their actual content, not assume relevance. Respond with strict JSON only, no prose outside the JSON."
     )
+    # 4000 chars was too tight -- a real SOP plus its annexures/forms easily
+    # runs longer than that, and whatever falls past the cutoff is completely
+    # invisible to the model: it can't flag that it's working from a partial
+    # document, it just silently judges coverage from whatever fit. That's a
+    # plausible root cause of "topically obvious" misses (e.g. a visual-
+    # inspection SOP's actual inspection-method section sitting past the
+    # cutoff, so the model never saw the part that would show it's covered).
+    # Claude's context window comfortably fits much more than this even with
+    # several SOPs concatenated for a full-site run.
     excerpt_block = "\n\n".join(
-        f"--- SOP [{e['sop_id']}] {e['sop_number']} - {e['title']} ---\n{e['text'][:4000]}" for e in sop_excerpts
+        f"--- SOP [{e['sop_id']}] {e['sop_number']} - {e['title']} ---\n{e['text'][:16000]}" for e in sop_excerpts
     )
     user_prompt = f"""Regulatory requirement to assess:
 Source: {requirement['source']}
@@ -323,7 +332,7 @@ def draft_redline(requirement, gap_description, sop_text, sop_title):
         "document -- propose only the new/amended text needed. Respond with strict JSON only."
     )
     user_prompt = f"""SOP being revised: {sop_title}
-Current SOP text (excerpt, may be partial): {sop_text[:4000]}
+Current SOP text (excerpt, may be partial): {sop_text[:16000]}
 
 Regulatory requirement driving this revision:
 Source: {requirement['source']} | Clause: {requirement['clause']}
@@ -392,7 +401,7 @@ def discover_uncovered_topics(sop_title, sop_category, sop_text, existing_requir
     existing_block = "\n".join(f"- {s}" for s in existing_requirement_summaries) or "(none tracked yet for this category)"
     user_prompt = f"""SOP: {sop_title} (category: {sop_category})
 SOP text (excerpt):
-{sop_text[:6000]}
+{sop_text[:16000]}
 
 Already-tracked requirements for this SOP's category:
 {existing_block}
@@ -469,7 +478,7 @@ def review_sop_quality(sop_title, sop_text):
     )
     user_prompt = f"""SOP: {sop_title}
 SOP text (excerpt):
-{sop_text[:8000]}
+{sop_text[:16000]}
 
 Respond with JSON exactly in this shape:
 {{
