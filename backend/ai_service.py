@@ -107,7 +107,13 @@ def assess_requirement_coverage(requirement, sop_excerpts):
         a mistagged or partially-relevant SOP can still get matched correctly,
         and a requirement with no genuinely relevant SOP gets an honest
         "SOP Missing" instead of a false "Not Covered" against an unrelated doc.
-    returns: dict {coverage_status, rationale, cited_text, sop_id, ai_mock}
+    returns: dict {coverage_status, rationale, cited_text, sop_id, ai_mock, findings}
+    findings: list of {finding_type, severity, section_ref, title, finding_text, recommendation} --
+        zero or more typed observations underneath the single coverage_status, using the
+        7-category taxonomy (Regulatory Gap / Procedural Gap / Documentation Gap /
+        Ambiguity-SOP Quality / Grammar-Editorial / Best-Practice Opportunity). A finding is
+        the granular, typed record; coverage_status stays the control-level rollup that drives
+        the existing Gaps/Redline pipeline unchanged.
     """
     if not sop_excerpts:
         return {
@@ -116,6 +122,7 @@ def assess_requirement_coverage(requirement, sop_excerpts):
             "cited_text": "",
             "sop_id": None,
             "ai_mock": True,
+            "findings": [],
         }
 
     system_prompt = (
@@ -161,19 +168,45 @@ short), never "SOP Missing". Reserve "SOP Missing" strictly for cases where the 
 genuinely different subject (e.g. checking a training-records SOP against a sterilization-validation
 requirement) -- not as a way to express "this SOP is inadequate."
 Only use "Covered" / "Partially Covered" / "Not Covered" when at least one SOP is genuinely on-topic for this
-requirement. Respond with JSON exactly in this shape:
+requirement.
+
+Separately from coverage_status, also list zero or more specific typed findings underneath it. Do NOT
+conflate categories -- a missing regulatory element (e.g. no verification step defined) is a different
+finding type than a grammar issue in the same paragraph, even if both come from the same section. Only
+include a finding when something is genuinely worth flagging; a fully "Covered" assessment can still have
+zero findings. Use exactly these finding_type values:
+"Regulatory Gap" (an applicable regulatory/control requirement appears absent or inadequately addressed),
+"Procedural Gap" (a necessary process/control step is missing or incomplete),
+"Documentation Gap" (the control may exist operationally but isn't sufficiently documented/referenced),
+"Ambiguity / SOP Quality" (wording is subjective, inconsistent, or not executable with sufficient clarity),
+"Grammar / Editorial" (language/spelling/punctuation issue with no compliance implication),
+"Best-Practice Opportunity" (a potential enhancement beyond the regulatory minimum -- never mandatory).
+
+Respond with JSON exactly in this shape:
 {{
   "coverage_status": "Covered" | "Partially Covered" | "Not Covered" | "SOP Missing",
   "sop_id": <the sop_id number that is most relevant, or null if none are relevant>,
   "cited_text": "<short exact quote from the SOP supporting your assessment, or empty string>",
-  "rationale": "<2-3 sentences explaining the assessment in plain language, referencing what is present or missing>"
+  "rationale": "<2-3 sentences explaining the assessment in plain language, referencing what is present or missing>",
+  "findings": [
+    {{
+      "finding_type": "Regulatory Gap" | "Procedural Gap" | "Documentation Gap" | "Ambiguity / SOP Quality" | "Grammar / Editorial" | "Best-Practice Opportunity",
+      "severity": "Critical" | "High" | "Medium" | "Low",
+      "section_ref": "<SOP section/clause number if identifiable, else empty string>",
+      "title": "<short label, e.g. 'Verification responsibility not defined'>",
+      "finding_text": "<1-2 sentences describing the specific issue>",
+      "recommendation": "<1-2 sentences: what should be done about it>"
+    }}
+  ]
 }}"""
     try:
-        raw = _call_claude(system_prompt, user_prompt, max_tokens=800)
+        raw = _call_claude(system_prompt, user_prompt, max_tokens=1600)
         parsed = _extract_json_object(raw)
         if "coverage_status" not in parsed:
             raise AIError("missing_coverage_status_in_response")
         parsed["ai_mock"] = False
+        if not isinstance(parsed.get("findings"), list):
+            parsed["findings"] = []
         return parsed
     except AIError:
         # Deterministic offline fallback. Since matching is no longer
@@ -207,6 +240,7 @@ requirement. Respond with JSON exactly in this shape:
                     "This is a placeholder assessment; connect a live Claude API key for real semantic analysis."
                 ),
                 "ai_mock": True,
+                "findings": [],
             }
         overlap = best_overlap
         if overlap > 0.35:
@@ -215,6 +249,20 @@ requirement. Respond with JSON exactly in this shape:
             status = "Partially Covered"
         else:
             status = "Not Covered"
+        findings = []
+        if status != "Covered":
+            # Offline mode can't produce genuine typed findings (no real reading
+            # of the text happened) -- one honest, clearly-labeled placeholder
+            # finding so the taxonomy UI has something to show rather than
+            # silently looking empty, instead of fabricating specific findings.
+            findings = [{
+                "finding_type": "Regulatory Gap",
+                "severity": "Medium",
+                "section_ref": "",
+                "title": "Offline heuristic placeholder finding",
+                "finding_text": f"Keyword overlap with '{best['title']}' is only {overlap:.0%}; a live Claude API key is needed for a real typed finding.",
+                "recommendation": "Connect a live Claude API key and re-run Check Compliance for a genuine assessment.",
+            }]
         return {
             "coverage_status": status,
             "sop_id": best["sop_id"],
@@ -225,6 +273,7 @@ requirement. Respond with JSON exactly in this shape:
                 "This is a placeholder assessment; connect a live Claude API key for real semantic analysis."
             ),
             "ai_mock": True,
+            "findings": findings,
         }
 
 

@@ -804,6 +804,28 @@ def _run_rtm_job(job_id, site_id, requested_sop_ids, actor, requested_sources=No
                     )
                     entry_id = cur.lastrowid
 
+                # Replace this requirement's findings wholesale on every re-run --
+                # same "re-run overwrites" semantics rtm_entries itself already
+                # has above. Only findings still Open/Under Review are safe to
+                # discard this way; anything a human already Accepted/Rejected/
+                # Modified is left alone so a re-run can't silently erase a
+                # recorded human decision.
+                conn.execute(
+                    "DELETE FROM findings WHERE rtm_entry_id=? AND status IN ('Open', 'Under Review')",
+                    (entry_id,),
+                )
+                for f in assessment.get("findings", []) or []:
+                    conn.execute(
+                        """INSERT INTO findings
+                           (rtm_entry_id, requirement_id, site_id, sop_id, finding_type, severity, section_ref,
+                            title, finding_text, recommendation, status, ai_mock, created_at, updated_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (entry_id, req_d["id"], site_id, sop_id, f.get("finding_type", "Documentation Gap"),
+                         f.get("severity", "Medium"), f.get("section_ref", ""), f.get("title", "")[:500],
+                         f.get("finding_text", ""), f.get("recommendation", ""), "Open",
+                         int(bool(assessment.get("ai_mock"))), db.now(), db.now()),
+                    )
+
                 # Auto-create/refresh a gap record for anything not fully covered --
                 # except "SOP Missing" from a single-SOP-scoped run (the normal case
                 # via the per-SOP "Check Compliance" button). "SOP Missing" there
@@ -1175,6 +1197,113 @@ def list_comparison():
         rows = conn.execute("SELECT * FROM comparison_findings ORDER BY id DESC").fetchall()
     conn.close()
     return jsonify(db.rows_to_list(rows))
+
+
+# ---------------------------------------------------------------------------
+# Findings -- the typed, 7-category observations Check Compliance produces
+# underneath each requirement's coverage_status. Deliberately separate from
+# Gaps: a Gap is the existing site-level remediation-tracking record (owner,
+# target date, risk level) tied to a whole requirement; a Finding is the
+# more granular AI observation feeding into it, reviewable on its own with
+# Accept/Modify/Reject/N/A/Escalate, independent of whether a Gap exists.
+# ---------------------------------------------------------------------------
+@app.route("/api/findings", methods=["GET"])
+@require_auth()
+def list_findings():
+    site_id = request.args.get("site_id")
+    sop_id = request.args.get("sop_id")
+    finding_type = request.args.get("finding_type")
+    status = request.args.get("status")
+    q = """
+        SELECT f.*, req.req_code, req.source, req.clause, req.requirement_text,
+               sop.sop_number, sop.title as sop_title, s.code as site_code, s.name as site_name
+        FROM findings f
+        LEFT JOIN requirements req ON req.id = f.requirement_id
+        LEFT JOIN sops sop ON sop.id = f.sop_id
+        JOIN sites s ON s.id = f.site_id
+        WHERE 1=1
+    """
+    params = []
+    if site_id:
+        q += " AND f.site_id=?"
+        params.append(site_id)
+    if sop_id:
+        q += " AND f.sop_id=?"
+        params.append(sop_id)
+    if finding_type:
+        q += " AND f.finding_type=?"
+        params.append(finding_type)
+    if status:
+        q += " AND f.status=?"
+        params.append(status)
+    q += " ORDER BY CASE f.severity WHEN 'Critical' THEN 0 WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END, f.id DESC"
+    conn = db.get_db()
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return jsonify(db.rows_to_list(rows))
+
+
+@app.route("/api/findings/<int:finding_id>/review", methods=["POST"])
+@require_auth()
+def review_finding(finding_id):
+    """Record a human review decision on a finding: Accept / Reject / Modify /
+    Not Applicable / Additional Evidence / Escalate. Always writes an
+    append-only review_decisions row carrying a frozen snapshot of the
+    finding's AI-generated content at the moment of the decision, so a
+    Modify or Reject never loses the original AI output -- it's preserved in
+    that snapshot even though the finding row itself is updated for display."""
+    data = request.get_json(force=True)
+    decision = data.get("decision")
+    valid_decisions = {"Accept", "Reject", "Modify", "Not Applicable", "Additional Evidence", "Escalate"}
+    if decision not in valid_decisions:
+        return jsonify({"error": "invalid_decision", "valid": sorted(valid_decisions)}), 400
+    rationale = (data.get("rationale") or "").strip()
+    if decision in {"Reject", "Modify"} and not rationale:
+        return jsonify({"error": "rationale_required_for_this_decision"}), 400
+
+    conn = db.get_db()
+    finding = conn.execute("SELECT * FROM findings WHERE id=?", (finding_id,)).fetchone()
+    if not finding:
+        conn.close()
+        return jsonify({"error": "finding_not_found"}), 404
+
+    original_snapshot = json.dumps({
+        "finding_type": finding["finding_type"], "severity": finding["severity"],
+        "title": finding["title"], "finding_text": finding["finding_text"],
+        "recommendation": finding["recommendation"],
+    })
+    modified_text = (data.get("modified_text") or "").strip() if decision == "Modify" else None
+    if decision == "Modify" and not modified_text:
+        conn.close()
+        return jsonify({"error": "modified_text_required_for_modify"}), 400
+
+    conn.execute(
+        """INSERT INTO review_decisions
+           (object_type, object_id, decision, decision_rationale, original_snapshot_json, modified_text, reviewer, decided_at)
+           VALUES ('finding', ?, ?, ?, ?, ?, ?, ?)""",
+        (finding_id, decision, rationale, original_snapshot, modified_text, actor_label(), db.now()),
+    )
+
+    status_map = {
+        "Accept": "Accepted", "Reject": "Rejected", "Not Applicable": "Not Applicable",
+        "Escalate": "Under Review", "Additional Evidence": "Under Review", "Modify": "Accepted",
+    }
+    new_status = status_map[decision]
+    if decision == "Modify":
+        # The finding row itself becomes the human-edited version for display
+        # purposes (the report/UI shows the reviewed text going forward) --
+        # the pre-edit AI original lives permanently in the review_decisions
+        # snapshot above, not lost.
+        conn.execute(
+            "UPDATE findings SET finding_text=?, status=?, updated_at=? WHERE id=?",
+            (modified_text, new_status, db.now(), finding_id),
+        )
+    else:
+        conn.execute("UPDATE findings SET status=?, updated_at=? WHERE id=?", (new_status, db.now(), finding_id))
+    conn.commit()
+    conn.close()
+    db.log_audit(actor_label(), "review_finding", "finding", finding_id, {"decision": decision, "rationale": rationale})
+    return jsonify({"ok": True, "status": new_status})
 
 
 # ---------------------------------------------------------------------------

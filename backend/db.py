@@ -208,6 +208,49 @@ CREATE TABLE IF NOT EXISTS discovery_candidates (
     reviewed_at TEXT,
     promoted_requirement_id INTEGER
 );
+
+-- Structured findings produced by Check Compliance, one requirement can
+-- produce zero or more of these -- deliberately separate from rtm_entries'
+-- single coverage_status. rtm_entries.coverage_status stays as the
+-- control-level rollup (Covered / Partially Covered / Not Covered / SOP
+-- Missing) that drives the existing Gaps/Redline pipeline unchanged; a
+-- `finding` is the more granular, typed observation underneath it (per the
+-- confirmed 7-category taxonomy), so a single "Partially Covered" control
+-- can carry both a Documentation Gap finding and an unrelated Grammar
+-- finding without collapsing them into one status.
+CREATE TABLE IF NOT EXISTS findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rtm_entry_id INTEGER REFERENCES rtm_entries(id),
+    requirement_id INTEGER REFERENCES requirements(id),
+    site_id INTEGER NOT NULL REFERENCES sites(id),
+    sop_id INTEGER REFERENCES sops(id),
+    finding_type TEXT NOT NULL,   -- Regulatory Gap | Procedural Gap | Documentation Gap | Ambiguity / SOP Quality | Grammar / Editorial | Best-Practice Opportunity
+    severity TEXT NOT NULL DEFAULT 'Medium',  -- Critical | High | Medium | Low
+    section_ref TEXT,
+    title TEXT NOT NULL,
+    finding_text TEXT NOT NULL,
+    recommendation TEXT,
+    status TEXT NOT NULL DEFAULT 'Open',  -- Open | Under Review | Accepted | Rejected | Not Applicable | Closed
+    ai_mock INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Immutable decision history for findings -- append-only by design (per the
+-- confirmed data-model decision) rather than overwriting a finding's own
+-- row, so the original AI output always survives a human Modify/Reject
+-- rather than being silently replaced.
+CREATE TABLE IF NOT EXISTS review_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    object_type TEXT NOT NULL DEFAULT 'finding',
+    object_id INTEGER NOT NULL,
+    decision TEXT NOT NULL,  -- Accept | Reject | Modify | Not Applicable | Additional Evidence | Escalate
+    decision_rationale TEXT,
+    original_snapshot_json TEXT,  -- the finding's title/finding_text/recommendation/severity at the moment of this decision, frozen
+    modified_text TEXT,           -- reviewer's replacement finding_text, only set on Modify
+    reviewer TEXT NOT NULL,
+    decided_at TEXT NOT NULL
+);
 """
 
 

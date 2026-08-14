@@ -41,10 +41,19 @@
   .badge.SOPMissing, .badge.SOP { background:#F4CCCC; color:#8B0000; }
   .badge.NotAssessed { background:#eee; color:#777; }
   .badge.Critical { background:#F4CCCC; color:#8B0000; }
-  .badge.Major { background:var(--yellow); color:var(--yellow-text); }
-  .badge.Minor { background:var(--grey-bg); color:var(--muted); }
+  .badge.Major, .badge.High { background:var(--yellow); color:var(--yellow-text); }
+  .badge.Minor, .badge.Low { background:var(--grey-bg); color:var(--muted); }
+  .badge.Medium { background:#FFE9CC; color:#9A5B00; }
   .badge.mock { background:#FFE9CC; color:#9A5B00; }
   .badge.live { background:var(--green); color:var(--green-text); }
+  .badge.Open { background:var(--grey-bg); color:var(--muted); }
+  .badge.Accepted { background:var(--green); color:var(--green-text); }
+  .badge.Rejected { background:var(--red); color:var(--red-text); }
+  .badge.UnderReview { background:#FFE9CC; color:#9A5B00; }
+  .badge.NotApplicable { background:#eee; color:#777; }
+  .badge.Closed { background:var(--grey-bg); color:var(--muted); }
+  .findingTypeChip { display:inline-block; padding:5px 12px; border-radius:16px; font-size:12px; font-weight:600; cursor:pointer; border:1px solid var(--border); background:#fff; margin:2px 4px 2px 0; }
+  .findingTypeChip.active { background:var(--navy); color:#fff; border-color:var(--navy); }
   select, input, textarea, button.btn { font-family:inherit; font-size:13px; padding:7px 10px; border:1px solid var(--border); border-radius:6px; }
   button.btn { background:var(--navy); color:#fff; border:none; cursor:pointer; font-weight:600; }
   button.btn:hover { background:var(--navy-light); }
@@ -78,7 +87,7 @@
 
 <script>
 const API = "/api"; // Flask serves this frontend and the API from the same origin.
-let state = { token: localStorage_token(), user: null, tab: "dashboard", sites: [], currentSiteId: null, lastComparisonReportId: null, lastComparisonTitle: null };
+let state = { token: localStorage_token(), user: null, tab: "dashboard", sites: [], currentSiteId: null, lastComparisonReportId: null, lastComparisonTitle: null, findingsTypeFilter: "" };
 
 function localStorage_token() { try { return sessionStorage.getItem("sop_token"); } catch(e) { return null; } }
 function setToken(t) { state.token = t; try { sessionStorage.setItem("sop_token", t || ""); } catch(e) {} }
@@ -163,6 +172,7 @@ const TABS = [
   { id: "dashboard", label: "Dashboard" },
   { id: "sops", label: "SOP Repository" },
   { id: "comparison", label: "Site Comparison" },
+  { id: "findings", label: "Findings" },
   { id: "gaps", label: "Gaps & Redlines" },
   { id: "discovery", label: "Suggested Requirements" },
   { id: "reports", label: "Reports" },
@@ -332,6 +342,7 @@ async function renderTab() {
     if (state.tab === "dashboard") main.innerHTML = await dashboardView();
     else if (state.tab === "sops") main.innerHTML = await sopsView();
     else if (state.tab === "comparison") main.innerHTML = await comparisonView();
+    else if (state.tab === "findings") main.innerHTML = await findingsView();
     else if (state.tab === "gaps") main.innerHTML = await gapsView();
     else if (state.tab === "discovery") main.innerHTML = await discoveryView();
     else if (state.tab === "reports") main.innerHTML = await reportsView();
@@ -832,6 +843,67 @@ async function discoveryView() {
   `;
 }
 
+// ---------------- Findings ----------------
+const FINDING_TYPES = ["Regulatory Gap", "Procedural Gap", "Documentation Gap", "Ambiguity / SOP Quality", "Grammar / Editorial", "Best-Practice Opportunity"];
+function findingBadgeClass(t) {
+  return { "Regulatory Gap": "NotCovered", "Procedural Gap": "Not", "Documentation Gap": "Partially",
+           "Ambiguity / SOP Quality": "mock", "Grammar / Editorial": "NotAssessed", "Best-Practice Opportunity": "Covered" }[t] || "NotAssessed";
+}
+async function findingsView() {
+  const canReview = ["admin", "quality_lead", "qa_reviewer", "site_owner"].includes(state.user.role);
+  const all = await api("/findings?site_id=" + state.currentSiteId);
+  const counts = {};
+  FINDING_TYPES.forEach(t => counts[t] = 0);
+  all.forEach(f => { counts[f.finding_type] = (counts[f.finding_type] || 0) + 1; });
+  const filtered = state.findingsTypeFilter ? all.filter(f => f.finding_type === state.findingsTypeFilter) : all;
+  const chips = `
+    <span class="findingTypeChip ${!state.findingsTypeFilter ? "active" : ""}" data-filter-type="">All (${all.length})</span>
+    ${FINDING_TYPES.map(t => `<span class="findingTypeChip ${state.findingsTypeFilter === t ? "active" : ""}" data-filter-type="${t}">${t} (${counts[t] || 0})</span>`).join("")}
+  `;
+  const rows = filtered.map(f => `
+    <tr data-finding="${f.id}">
+      <td>${f.req_code || ""}<br/><span class="muted">${f.source || ""} ${f.clause || ""}</span></td>
+      <td><span class="badge ${findingBadgeClass(f.finding_type)}">${f.finding_type}</span></td>
+      <td><span class="badge ${f.severity}">${f.severity}</span></td>
+      <td>${f.sop_number || ""}${f.section_ref ? `<br/><span class="muted">Sec ${f.section_ref}</span>` : ""}</td>
+      <td style="max-width:280px;"><b>${f.title}</b><br/><span class="muted">${f.finding_text}</span>${f.recommendation ? `<br/><span class="muted"><i>Recommended: ${f.recommendation}</i></span>` : ""}</td>
+      <td><span class="badge ${f.status.replace(/\s/g,'')}">${f.status}</span>${f.ai_mock ? `<br/><span class="badge mock">AI mock</span>` : ""}</td>
+      <td>${canReview && (f.status === "Open" || f.status === "Under Review") ? `<button class="btn small reviewFindingBtn" data-finding="${f.id}">Review</button>` : `<span class="muted">no action</span>`}</td>
+    </tr>
+    <tr class="findingReviewRow hidden" data-finding-form="${f.id}">
+      <td colspan="7">
+        <div class="row" style="flex-wrap:wrap; gap:8px; align-items:flex-start;">
+          <div class="field"><label>Decision</label>
+            <select class="finding_decision" data-finding="${f.id}">
+              <option value="Accept">Accept</option>
+              <option value="Modify">Modify</option>
+              <option value="Reject">Reject</option>
+              <option value="Not Applicable">Not Applicable</option>
+              <option value="Additional Evidence">Request Additional Evidence</option>
+              <option value="Escalate">Escalate to Regulatory SME</option>
+            </select>
+          </div>
+          <div class="field modifyTextField hidden" style="flex:1; min-width:260px;"><label>Modified finding text</label>
+            <input class="finding_modified_text" value="${(f.finding_text||"").replace(/"/g,'&quot;')}" style="width:100%;" />
+          </div>
+          <div class="field" style="flex:1; min-width:220px;"><label>Rationale (required for Reject/Modify)</label>
+            <input class="finding_rationale" style="width:100%;" placeholder="Why this decision?" />
+          </div>
+          <button class="btn small saveFindingReviewBtn" data-finding="${f.id}">Save Decision</button>
+          <button class="btn small secondary cancelFindingReviewBtn" data-finding="${f.id}">Cancel</button>
+        </div>
+      </td>
+    </tr>`).join("") || `<tr><td colspan="7" class="muted">No findings yet for ${siteLabel()} — run Check Compliance on an SOP in SOP Repository.</td></tr>`;
+  return `
+    <div class="card">
+      <h2>Findings — ${siteLabel()}</h2>
+      <p class="muted">Every Check Compliance run produces typed findings underneath its Covered/Partially Covered/Not Covered/SOP Missing result. Each finding is reviewed independently (Accept/Modify/Reject/N/A/Escalate) — a Modify or Reject never discards the original AI output, it's preserved for audit even after your decision.</p>
+      <div style="margin-bottom:12px;">${chips}</div>
+      <table><thead><tr><th>Requirement</th><th>Type</th><th>Severity</th><th>SOP / Section</th><th>Finding</th><th>Status</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>
+  `;
+}
+
 // ---------------- Revisions (Review & Approval) ----------------
 async function revisionsView() {
   const revs = await api("/revisions");
@@ -1106,6 +1178,54 @@ function bindTabHandlers() {
 
   document.querySelectorAll(".checkComplianceBtn").forEach(btn => {
     btn.onclick = () => openRegulationsModal(btn);
+  });
+
+  document.querySelectorAll(".findingTypeChip").forEach(chip => {
+    chip.onclick = () => { state.findingsTypeFilter = chip.dataset.filterType || ""; renderTab(); };
+  });
+  document.querySelectorAll(".reviewFindingBtn").forEach(btn => {
+    btn.onclick = () => {
+      document.querySelector(`.findingReviewRow[data-finding-form="${btn.dataset.finding}"]`).classList.remove("hidden");
+    };
+  });
+  document.querySelectorAll(".cancelFindingReviewBtn").forEach(btn => {
+    btn.onclick = () => {
+      document.querySelector(`.findingReviewRow[data-finding-form="${btn.dataset.finding}"]`).classList.add("hidden");
+    };
+  });
+  document.querySelectorAll(".finding_decision").forEach(sel => {
+    const toggle = () => {
+      const field = sel.closest("td").querySelector(".modifyTextField");
+      if (field) field.classList.toggle("hidden", sel.value !== "Modify");
+    };
+    sel.onchange = toggle;
+    toggle();
+  });
+  document.querySelectorAll(".saveFindingReviewBtn").forEach(btn => {
+    btn.onclick = async () => {
+      const row = document.querySelector(`.findingReviewRow[data-finding-form="${btn.dataset.finding}"]`);
+      const decision = row.querySelector(".finding_decision").value;
+      const rationale = row.querySelector(".finding_rationale").value.trim();
+      const modifiedText = row.querySelector(".finding_modified_text").value.trim();
+      if ((decision === "Reject" || decision === "Modify") && !rationale) {
+        toast("Rationale is required for Reject/Modify."); return;
+      }
+      if (decision === "Modify" && !modifiedText) {
+        toast("Modified finding text is required for Modify."); return;
+      }
+      btn.disabled = true; btn.textContent = "Saving…";
+      try {
+        await api(`/findings/${btn.dataset.finding}/review`, {
+          method: "POST",
+          body: JSON.stringify({ decision, rationale, modified_text: modifiedText }),
+        });
+        toast(`Finding ${decision === "Accept" ? "accepted" : decision.toLowerCase()}.`);
+        renderTab();
+      } catch (e) {
+        toast("Error: " + e.message);
+        btn.disabled = false; btn.textContent = "Save Decision";
+      }
+    };
   });
 
   const applyCompareFilter = () => {
