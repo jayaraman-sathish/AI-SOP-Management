@@ -273,7 +273,15 @@ def compare_sops_across_sites(sop_category, site_sops):
     system_prompt = (
         "You are a pharmaceutical GMP compliance analyst comparing how different manufacturing sites "
         "execute the same SOP category. Identify concrete, checkable differences (parameters, frequencies, "
-        "acceptance criteria, steps) -- not vague summaries. Respond with strict JSON only."
+        "acceptance criteria, steps, PPE/gowning specifics, which specific forms/annexures/templates each "
+        "site references for recording the same data) -- not vague summaries like 'documents differ in "
+        "structure'. Example of the granularity expected: one site's SOP specifies pink shoe covers, "
+        "another specifies blue -- that is a real finding, not a paraphrase-worthy detail to skip. Similarly, "
+        "one site recording an inspection result on an 'Annexure' while another uses a 'Format' for the same "
+        "step is a real finding (naming-convention or process divergence), even if the underlying data "
+        "captured is similar. For every finding, also propose a concrete recommended action (e.g. harmonize "
+        "both sites to one approach, or confirm the divergence is deliberately site-specific and document why). "
+        "Respond with strict JSON only."
     )
     blocks = "\n\n".join(
         f"--- Site {s['site_code']} ({s['site_name']}) - {s['sop_number']} {s['title']} ---\n{s['text'][:3500]}"
@@ -291,21 +299,37 @@ Respond with JSON exactly in this shape:
 {{
   "findings": [
     {{
-      "process_step": "<short label, e.g. 'Media fill frequency'>",
-      "site_values": {{"<site_code>": "<what that site's SOP says>", ...}},
+      "process_step": "<short label, e.g. 'Media fill frequency', 'Shoe cover color', 'Inspection record form'>",
+      "site_values": {{"<site_code>": "<what that site's SOP says, quote/paraphrase specifically>", ...}},
       "classification": "No Regulatory Impact" | "Best-Practice Divergence" | "Compliance-Relevant Divergence",
-      "note": "<1-2 sentence explanation, cite the regulatory concern if compliance-relevant>"
+      "note": "<1-2 sentence explanation, cite the regulatory concern if compliance-relevant>",
+      "recommended_action": "<1-2 sentences: what should be done about this divergence -- harmonize to one site's approach, standardize, or explicitly document the justification for keeping it site-specific>"
     }}
   ]
 }}"""
     try:
-        raw = _call_claude(system_prompt, user_prompt, max_tokens=1500)
+        # 1500 tokens was too tight for genuinely detailed, multi-finding
+        # comparisons (the exact kind this is meant to catch -- PPE color
+        # differences, annexure-vs-format recording differences, etc.) --
+        # hitting max_tokens truncates the JSON mid-response, which
+        # _extract_json_object correctly raises as AIError for, but that
+        # then silently fell back to a vague placeholder that misleadingly
+        # blamed "no API key configured" even when a key WAS configured and
+        # the call genuinely ran, just got cut off. Same class of bug already
+        # fixed for discover_uncovered_topics elsewhere in this file.
+        raw = _call_claude(system_prompt, user_prompt, max_tokens=3000)
         parsed = _extract_json_object(raw)
         findings = parsed.get("findings", [])
         if not isinstance(findings, list):
             raise AIError("findings_not_a_list")
-        return {"findings": findings, "ai_mock": False}
-    except AIError:
+        return {"findings": findings, "ai_mock": False, "offline_note": None}
+    except AIError as e:
+        # Report the REAL reason the live call failed (bad/truncated JSON, an
+        # HTTP error, a timeout, or genuinely no key configured) instead of
+        # always claiming "no API key configured" regardless of cause -- that
+        # was actively misleading when a key was configured elsewhere in the
+        # app but this specific call still failed for a different reason.
+        reason = str(e)
         return {
             "findings": [
                 {
@@ -313,12 +337,15 @@ Respond with JSON exactly in this shape:
                     "site_values": {s["site_code"]: f"{s['sop_number']} v.—" for s in site_sops},
                     "classification": "Best-Practice Divergence",
                     "note": (
-                        "[Offline heuristic mode - no ANTHROPIC_API_KEY configured] Documents differ in length/"
-                        "structure; connect a live Claude API key for a real parameter-level comparison."
+                        f"[Offline/fallback mode -- live AI comparison failed ({reason})] Documents differ in "
+                        "length/structure; this is a placeholder only, not a real parameter-level comparison. "
+                        "See Admin > Error Log for the logged failure reason, or re-run once resolved."
                     ),
+                    "recommended_action": "Re-run this comparison once the underlying AI failure is resolved -- no real recommendation can be made from a placeholder result.",
                 }
             ],
             "ai_mock": True,
+            "offline_note": reason,
         }
 
 

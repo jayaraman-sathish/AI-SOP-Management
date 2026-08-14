@@ -314,11 +314,18 @@ def _result_table(doc, results, empty_note, compact=False):
 
 def generate_comparison_report(output_path, sops_compared, findings, ai_mock=False, report_id=None):
     """
-    sops_compared: list of {site_code, site_name, sop_number, title}
+    sops_compared: list of {site_code, site_name, sop_number, title, version_label}
     findings: list of {process_step, site_values (dict), classification, note}
+
+    version_label is printed alongside each SOP so a re-comparison run after
+    an SOP revision produces a report that's unambiguously distinguishable
+    from an earlier comparison of the same SOP pair -- not just by timestamp.
     """
     doc = Document()
-    scope = "; ".join(f"{s['site_code']} — {s['sop_number']} {s['title']}" for s in sops_compared)
+    scope = "; ".join(
+        f"{s['site_code']} — {s['sop_number']} ({s.get('version_label') or 'version unknown'}) {s['title']}"
+        for s in sops_compared
+    )
     _title_block(doc, "SOP Site Comparison Report", scope)
 
     if report_id is not None:
@@ -345,7 +352,7 @@ def generate_comparison_report(output_path, sops_compared, findings, ai_mock=Fal
         doc.add_paragraph("No differences were identified -- the compared SOPs appear consistent on the points reviewed.")
     else:
         site_codes = sorted({s["site_code"] for s in sops_compared})
-        cols = ["Process Step"] + site_codes + ["Classification", "Note"]
+        cols = ["Process Step"] + site_codes + ["Classification", "Note", "Recommended Action"]
         table = doc.add_table(rows=1 + len(findings), cols=len(cols))
         table.style = "Table Grid"
         hdr = table.rows[0]
@@ -360,6 +367,7 @@ def generate_comparison_report(output_path, sops_compared, findings, ai_mock=Fal
                 _set_cell_text(row.cells[ci], site_values.get(code, ""), size=9)
             _set_cell_text(row.cells[len(site_codes) + 1], f.get("classification", ""), size=9)
             _set_cell_text(row.cells[len(site_codes) + 2], f.get("note", ""), size=9)
+            _set_cell_text(row.cells[len(site_codes) + 3], f.get("recommended_action", ""), size=9)
 
     doc.save(output_path)
     return output_path

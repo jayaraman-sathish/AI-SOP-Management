@@ -1056,11 +1056,19 @@ def run_comparison():
 
     conn = db.get_db()
     placeholders = ",".join("?" for _ in sop_ids)
+    # sv.version_label/uploaded_at captured here at comparison time -- this is
+    # what makes a re-comparison after an SOP revision distinguishable from the
+    # earlier one. Without pinning the version, two comparisons of "O-PI076
+    # vs PR046" a week apart (one before a correction, one after) would look
+    # identical in the report except for the timestamp -- no way to tell
+    # which document version was actually evaluated each time.
     rows = conn.execute(f"""
         SELECT sop.id as sop_id, sites.code as site_code, sites.name as site_name,
-               sop.sop_number, sop.title, sop.sop_category
+               sop.sop_number, sop.title, sop.sop_category,
+               sv.id as version_id, sv.version_label, sv.uploaded_at as version_uploaded_at
         FROM sops sop
         JOIN sites ON sites.id = sop.site_id
+        LEFT JOIN sop_versions sv ON sv.sop_id = sop.id AND sv.is_current = 1
         WHERE sop.id IN ({placeholders})
     """, sop_ids).fetchall()
     if len(rows) < 2:
@@ -1072,12 +1080,20 @@ def run_comparison():
         site_sops.append({
             "site_code": r["site_code"], "site_name": r["site_name"],
             "sop_number": r["sop_number"], "title": r["title"],
+            "version_label": r["version_label"] or "unknown version",
             "text": db.full_sop_text(conn, r["sop_id"]),
         })
     categories = sorted({r["sop_category"] for r in rows if r["sop_category"]})
     label = categories[0] if len(categories) == 1 else (", ".join(categories) if categories else "Selected SOPs")
 
     result = ai_service.compare_sops_across_sites(label, site_sops)
+    if result.get("ai_mock") and result.get("offline_note"):
+        # compare_sops_across_sites now reports the REAL reason the live AI
+        # call failed (bad JSON, timeout, HTTP error, etc.) instead of always
+        # claiming "no API key configured" regardless of cause -- log it so
+        # it's diagnosable from Admin > Error Log instead of silently
+        # degrading to a vague placeholder with a misleading explanation.
+        db.log_error("ai_comparison_fallback", result["offline_note"], context={"sop_ids": sop_ids})
 
     # Generate the downloadable report FIRST so every finding row below can be
     # tagged with the report_id it belongs to (see comparison_findings.report_id
@@ -1087,24 +1103,38 @@ def run_comparison():
     # the on-screen results table looked like stale/wrong data after every
     # new comparison.
     report_id = None
-    title = f"Comparison Report — {', '.join(r['sop_number'] for r in rows)}"
+    # Version label baked into the title itself -- so a re-comparison after a
+    # correction produces a title that's visibly different from the earlier
+    # one at a glance (in Reports tab, Audit Trail, downloads folder, etc.),
+    # not just distinguishable by timestamp.
+    sop_version_labels = [f"{r['sop_number']} {r['version_label'] or ''}".strip() for r in rows]
+    title = f"Comparison Report — {', '.join(sop_version_labels)}"
+    comparison_scope = [
+        {
+            "site_code": r["site_code"], "site_name": r["site_name"], "sop_id": r["sop_id"],
+            "sop_number": r["sop_number"], "title": r["title"],
+            "version_label": r["version_label"], "version_id": r["version_id"],
+            "version_uploaded_at": r["version_uploaded_at"],
+        }
+        for r in rows
+    ]
     try:
         # Reserve the reports row first (empty filepath) so the report's own
         # ID is known before the docx is generated and can be printed inside
         # it -- a downloaded file can then be cross-referenced back to the
         # Reports tab / Audit Trail on its own, without the browser tab.
         cur = conn.execute(
-            "INSERT INTO reports (report_type, site_id, sop_id, title, filepath, created_by, created_at) VALUES (?,?,?,?,?,?,?)",
-            ("comparison", None, None, title, "", actor_label(), db.now()),
+            "INSERT INTO reports (report_type, site_id, sop_id, title, filepath, created_by, created_at, comparison_scope_json) VALUES (?,?,?,?,?,?,?,?)",
+            ("comparison", None, None, title, "", actor_label(), db.now(), json.dumps(comparison_scope)),
         )
         report_id = cur.lastrowid
-        sops_compared = [{"site_code": r["site_code"], "site_name": r["site_name"], "sop_number": r["sop_number"], "title": r["title"]} for r in rows]
+        sops_compared = [{"site_code": r["site_code"], "site_name": r["site_name"], "sop_number": r["sop_number"], "title": r["title"], "version_label": r["version_label"]} for r in rows]
         stored_name = f"comparison_report_{secrets.token_hex(4)}.docx"
         report_path = os.path.join(GEN_DIR, stored_name)
         report_service.generate_comparison_report(report_path, sops_compared, result["findings"], ai_mock=result.get("ai_mock", False), report_id=report_id)
         conn.execute("UPDATE reports SET filepath=? WHERE id=?", (report_path, report_id))
         conn.commit()
-        db.log_audit(actor_label(), "report_generated", "report", report_id, {"title": title, "kind": "comparison"})
+        db.log_audit(actor_label(), "report_generated", "report", report_id, {"title": title, "kind": "comparison", "scope": comparison_scope})
     except Exception as e:
         db.log_error("comparison_report_generation", f"{type(e).__name__}: {e}", traceback_text=traceback.format_exc(), context={"sop_ids": sop_ids})
         db.log_audit(actor_label(), "report_generation_failed", "sop_ids", None, {"sop_ids": sop_ids, "error": f"{type(e).__name__}: {e}"})

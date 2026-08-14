@@ -663,10 +663,17 @@ async function comparisonView() {
       <td>${valStr}</td>
       <td><span class="badge ${f.classification.includes("Compliance") ? "NotCovered" : f.classification.includes("Best") ? "Partially" : "Covered"}">${f.classification}</span></td>
       <td>${f.note || ""}</td>
+      <td>${f.recommended_action || ""}</td>
     </tr>`;
-  }).join("") || `<tr><td colspan="5" class="muted">${state.lastComparisonReportId ? "This comparison found no differences to report." : "No comparison run yet this session — select SOPs below and click Compare."}</td></tr>`;
+  }).join("") || `<tr><td colspan="6" class="muted">${state.lastComparisonReportId ? "This comparison found no differences to report." : "No comparison run yet this session — select SOPs below and click Compare."}</td></tr>`;
 
+  // Real deployments run 100+ SOPs per site -- a flat checkbox list grouped
+  // only by site header doesn't scale past a handful. A live text filter
+  // (by SOP number/title) plus a category quick-filter (the natural anchor
+  // for "the same procedure across sites") narrows the list down to what's
+  // actually relevant instead of making the user scroll through everything.
   const allSops = await api("/sops?site_id=");
+  const categories = Array.from(new Set(allSops.map(s => s.sop_category).filter(Boolean))).sort();
   const bySite = {};
   allSops.forEach(s => {
     const key = s.site_code || "Unknown Site";
@@ -674,10 +681,10 @@ async function comparisonView() {
     (bySite[key] = bySite[key] || { label, sops: [] }).sops.push(s);
   });
   const checklist = Object.keys(bySite).sort().map(key => `
-    <div style="margin-bottom:8px;">
+    <div class="compareSiteGroup" style="margin-bottom:8px;">
       <b style="font-size:12px;">${bySite[key].label}</b><br/>
       ${bySite[key].sops.map(s => `
-        <label style="display:inline-flex; align-items:center; gap:4px; margin:2px 10px 2px 0; font-size:13px;">
+        <label class="compareSopRow" data-search="${(s.sop_number + " " + s.title + " " + (s.sop_category||"")).toLowerCase().replace(/"/g,'&quot;')}" data-category="${(s.sop_category||"").replace(/"/g,'&quot;')}" style="display:inline-flex; align-items:center; gap:4px; margin:2px 10px 2px 0; font-size:13px;">
           <input type="checkbox" class="compareSopCheck" value="${s.id}" /> ${s.sop_number} <span class="muted">(${s.sop_category || "no category"})</span>
         </label>`).join("")}
     </div>`).join("") || `<p class="muted">No SOPs uploaded anywhere yet.</p>`;
@@ -687,13 +694,20 @@ async function comparisonView() {
       <h2>Site-to-Site Comparison</h2>
       <p class="muted">SOPs below are grouped by plant/site — check the specific SOPs you want compared (select at least 2, from any plant(s)) — this no longer auto-pulls every SOP sharing a category. On submit, the system compares only what you selected, lists concrete differences, and generates a downloadable Comparison Report (logged in the Reports tab).</p>
       ${state.aiLive ? "" : `<div class="ai-banner">⚠ Running in offline heuristic mode — no ANTHROPIC_API_KEY configured on the server. Comparison findings below are placeholder results, clearly flagged "AI mock".</div>`}
-      <div style="margin-bottom:10px;">${checklist}</div>
+      <div class="row" style="gap:10px; margin-bottom:8px;">
+        <input id="compareSearchInput" placeholder="Filter by SOP number, title, or category…" style="flex:1; min-width:220px;" />
+        <select id="compareCategorySelect" style="min-width:200px;">
+          <option value="">All categories</option>
+          ${categories.map(c => `<option value="${c.replace(/"/g,'&quot;')}">${c}</option>`).join("")}
+        </select>
+      </div>
+      <div id="compareChecklist" style="margin-bottom:10px; max-height:320px; overflow:auto; border:1px solid var(--border); border-radius:6px; padding:8px;">${checklist}</div>
       <div class="row">
         <button class="btn" id="runCompareBtn">Compare Selected SOPs</button>
         <span class="muted">Select 2 or more SOPs above, from any plant(s), to compare.</span>
       </div>
       <h3 style="margin-top:20px;">${state.lastComparisonReportId ? `Results — <span class="badge">RPT-${state.lastComparisonReportId}</span> ${escHtml(state.lastComparisonTitle || "")}` : "Results"}</h3>
-      <table><thead><tr><th>Category</th><th>Process Step</th><th>Site Values</th><th>Classification</th><th>Note</th></tr></thead><tbody>${rows}</tbody></table>
+      <table><thead><tr><th>Category</th><th>Process Step</th><th>Site Values</th><th>Classification</th><th>Note</th><th>Recommended Action</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
   `;
 }
@@ -707,12 +721,23 @@ async function reportsView() {
       const parsed = r.regulations_json ? JSON.parse(r.regulations_json) : [];
       regs = Array.isArray(parsed) && parsed.length ? parsed.join(", ") : "";
     } catch (e) { regs = ""; }
+    // For comparison reports, comparison_scope_json pins exactly which SOPs
+    // AND which document version were compared -- necessary because SOPs get
+    // revised, so a later re-comparison of "the same" SOP pair needs to be
+    // distinguishable from an earlier one, not just by timestamp.
+    let scope = [r.site_code, r.sop_number].filter(Boolean).join(" — ");
+    if (!scope && r.comparison_scope_json) {
+      try {
+        const items = JSON.parse(r.comparison_scope_json);
+        scope = items.map(i => `${i.site_code} — ${i.sop_number} (${i.version_label || "version unknown"})`).join("; ");
+      } catch (e) { /* fall through to default */ }
+    }
     return `
     <tr>
       <td><span class="badge">RPT-${r.id}</span></td>
       <td>${r.report_type === "compliance_check" ? "Compliance Check" : r.report_type === "comparison" ? "Site Comparison" : r.report_type}</td>
       <td>${r.title}</td>
-      <td>${[r.site_code, r.sop_number].filter(Boolean).join(" — ") || "<span class='muted'>multiple / all sites</span>"}</td>
+      <td>${scope || "<span class='muted'>multiple / all sites</span>"}</td>
       <td>${regs || "<span class='muted'>—</span>"}</td>
       <td>${(r.created_at || "").slice(0,16).replace("T", " ")}</td>
       <td>${r.created_by || ""}</td>
@@ -1082,6 +1107,24 @@ function bindTabHandlers() {
   document.querySelectorAll(".checkComplianceBtn").forEach(btn => {
     btn.onclick = () => openRegulationsModal(btn);
   });
+
+  const applyCompareFilter = () => {
+    const q = (document.getElementById("compareSearchInput")?.value || "").toLowerCase().trim();
+    const cat = document.getElementById("compareCategorySelect")?.value || "";
+    document.querySelectorAll(".compareSopRow").forEach(row => {
+      const matchesText = !q || row.dataset.search.includes(q);
+      const matchesCat = !cat || row.dataset.category === cat;
+      row.style.display = (matchesText && matchesCat) ? "inline-flex" : "none";
+    });
+    document.querySelectorAll(".compareSiteGroup").forEach(group => {
+      const anyVisible = Array.from(group.querySelectorAll(".compareSopRow")).some(r => r.style.display !== "none");
+      group.style.display = anyVisible ? "" : "none";
+    });
+  };
+  const compareSearchInput = document.getElementById("compareSearchInput");
+  if (compareSearchInput) compareSearchInput.oninput = applyCompareFilter;
+  const compareCategorySelect = document.getElementById("compareCategorySelect");
+  if (compareCategorySelect) compareCategorySelect.onchange = applyCompareFilter;
 
   const runCompareBtn = document.getElementById("runCompareBtn");
   if (runCompareBtn) runCompareBtn.onclick = async () => {
